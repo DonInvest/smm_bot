@@ -561,7 +561,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result_x.get("ok"):
         lines.append("✅ X: posted")
     else:
-        lines.append(f"❌ X: {result_x}")
+        err = result_x
+        if err.get("status") == 401:
+            lines.append(
+                "❌ X: 401 Unauthorized — токен истёк.\n"
+                "• Если в .env есть X_API_KEY и X_ACCESS_TOKEN (OAuth1) — постинг идёт по ним; при 401 автообновление только у OAuth2. Либо обнови OAuth1-токены в X Developer Portal, либо удали с сервера эти 4 переменные (X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET), тогда будет использоваться OAuth2 с автообновлением.\n"
+                "• Для OAuth2 на сервере нужны X_REFRESH_TOKEN, X_CLIENT_ID, X_CLIENT_SECRET и актуальный .x_tokens.json или X_USER_ACCESS_TOKEN. После правок: systemctl restart smm_bot"
+            )
+        else:
+            lines.append(f"❌ X: {err}")
 
     if result_fc.get("ok"):
         lines.append("✅ Farcaster: posted")
