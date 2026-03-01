@@ -13,7 +13,9 @@ from google import genai
 from google.genai import types as genai_types
 from requests_oauthlib import OAuth1
 
-load_dotenv()
+# .env рядом с main.py — так ключи видны и при запуске через systemd
+_load_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_load_env_path)
 
 # Функция автоматической очистки ключей
 def clean_token(token_name):
@@ -131,12 +133,11 @@ X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
 X_TCO_URL_LEN = 23  # приближение: X считает каждый URL как фиксированную длину
 
-# Инициализация Gemini (Developer API / v1, под твой лимит Gemini 2.5 Flash)
+# Gemini: новый SDK (google-genai) + api_version v1 — квота у тебя на gemini-2.5-flash
 client_ai = genai.Client(
     api_key=GEMINI_KEY,
     http_options=genai_types.HttpOptions(api_version="v1"),
 )
-# Используем модель с квотой из скриншота
 MODEL_NAME = "gemini-2.5-flash"
 
 
