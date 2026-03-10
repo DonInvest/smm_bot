@@ -14,8 +14,9 @@ from google.genai import types as genai_types
 from requests_oauthlib import OAuth1
 
 # .env рядом с main.py — так ключи видны и при запуске через systemd
+# override=True: значения из .env перезаписывают env, иначе на сервере могли остаться пустые
 _load_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(_load_env_path)
+load_dotenv(_load_env_path, override=True)
 
 # Функция автоматической очистки ключей
 def clean_token(token_name):
@@ -226,15 +227,26 @@ def clamp_to_limits(text: str) -> str:
     return t.strip()
 
 
-def upload_media_to_x(photo_path: str) -> dict:
+def upload_media_to_x(
+    photo_path: str,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+    access_token: Optional[str] = None,
+    access_token_secret: Optional[str] = None,
+) -> dict:
     """
     Загружаем фото в X через v1.1 media/upload (OAuth 1.0a).
+    Ключи можно передать явно; иначе берутся из глобальных переменных.
     """
-    if not (X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET):
+    key = api_key or X_API_KEY
+    secret = api_secret or X_API_SECRET
+    tok = access_token or X_ACCESS_TOKEN
+    tok_secret = access_token_secret or X_ACCESS_TOKEN_SECRET
+    if not (key and secret and tok and tok_secret):
         return {"ok": False, "error": "Missing X OAuth1 keys for media upload"}
 
     url = "https://upload.twitter.com/1.1/media/upload.json"
-    auth = OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+    auth = OAuth1(key, secret, tok, tok_secret)
     try:
         with open(photo_path, "rb") as f:
             resp = requests.post(url, files={"media": f}, auth=auth, timeout=30)
@@ -249,8 +261,8 @@ def upload_media_to_x(photo_path: str) -> dict:
 def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
     """
     Публикуем пост в X API v2.
-    - Если есть OAuth1 ключи, используем OAuth1 (нужно для media upload)
-    - Иначе используем OAuth2 user access token
+    Всегда используем OAuth2 (Bearer) для твита — так не будет 401 при истёкших OAuth1.
+    Фото загружаются отдельно через upload_media_to_x (OAuth1), сюда передаются уже media_ids.
     """
     url = "https://api.x.com/2/tweets"
     clean = clamp_to_limits(text)
@@ -259,15 +271,11 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
         payload["media"] = {"media_ids": media_ids}
 
     try:
-        if X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET:
-            auth = OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
-            resp = requests.post(url, json=payload, auth=auth, timeout=20)
-        else:
-            headers = {
-                "Authorization": f"Bearer {_get_x_access_token()}",
-                "Content-Type": "application/json",
-            }
-            resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        headers = {
+            "Authorization": f"Bearer {_get_x_access_token()}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
 
         data = resp.json()
         if resp.status_code in (200, 201) and "data" in data:
@@ -531,14 +539,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skipped_photo_reason = None
 
     if photo_file_id:
-        if X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET:
+        # Перечитываем .env при каждом постинге — подхватим ключи после копирования .env на сервер без рестарта
+        load_dotenv(_load_env_path, override=True)
+        oauth1_key = (os.getenv("X_API_KEY") or "").strip()
+        oauth1_secret = (os.getenv("X_API_SECRET") or "").strip()
+        oauth1_token = (os.getenv("X_ACCESS_TOKEN") or "").strip()
+        oauth1_token_secret = (os.getenv("X_ACCESS_TOKEN_SECRET") or "").strip()
+        if oauth1_key and oauth1_secret and oauth1_token and oauth1_token_secret:
             tmp_path = None
             try:
                 tg_file = await context.bot.get_file(photo_file_id)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp_path = tmp.name
                 await tg_file.download_to_drive(custom_path=tmp_path)
-                up = upload_media_to_x(tmp_path)
+                up = upload_media_to_x(
+                    tmp_path,
+                    api_key=oauth1_key,
+                    api_secret=oauth1_secret,
+                    access_token=oauth1_token,
+                    access_token_secret=oauth1_token_secret,
+                )
                 if up.get("ok"):
                     media_ids = [up["media_id"]]
                 else:
@@ -552,7 +572,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
         else:
-            skipped_photo_reason = "no X OAuth1 keys for media upload (X_API_KEY/SECRET + X_ACCESS_TOKEN/SECRET)"
+            oauth1_status = " ".join(
+                f"{k}={('ok' if v else 'missing')}"
+                for k, v in [
+                    ("X_API_KEY", bool(oauth1_key)),
+                    ("X_API_SECRET", bool(oauth1_secret)),
+                    ("X_ACCESS_TOKEN", bool(oauth1_token)),
+                    ("X_ACCESS_TOKEN_SECRET", bool(oauth1_token_secret)),
+                ]
+            )
+            skipped_photo_reason = f"no X OAuth1 keys for media upload ({oauth1_status}). Скопируй .env на сервер (copy_env_to_server.sh), затем systemctl restart smm_bot (или просто отправь пост ещё раз — .env перечитывается при каждом нажатии)"
 
     result_x = post_to_x(text_to_post, media_ids=media_ids)
     result_fc = post_to_farcaster(text_to_post)
@@ -584,11 +613,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    # Принимаем любые сообщения без команд:
-    # - текст
-    # - пересланные посты
-    # - фото/видео/документы с подписью
     app.add_handler(MessageHandler(~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
+    oauth1_count = sum(1 for v in [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET] if v)
     print(f"🚀 Бот @Don_Inv запущен на {MODEL_NAME}")
+    print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     app.run_polling()
