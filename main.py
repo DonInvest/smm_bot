@@ -129,6 +129,9 @@ X_ACCESS_TOKEN_SECRET = clean_token("X_ACCESS_TOKEN_SECRET")
 NEYNAR_API_KEY = clean_token("NEYNAR_API_KEY")
 NEYNAR_SIGNER_UUID = clean_token("NEYNAR_SIGNER_UUID")
 
+# Imgbb для загрузки изображений в Farcaster (альтернатива Imgur)
+IMGBB_API_KEY = clean_token("IMGBB_API_KEY")
+
 # Лимиты
 X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
@@ -296,7 +299,36 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def post_to_farcaster(text: str):
+def upload_image_to_imgbb(photo_path: str, api_key: Optional[str] = None) -> dict:
+    """
+    Загружаем фото в Imgbb (альтернатива Imgur).
+    Возвращает {"ok": True, "url": "https://..."} или {"ok": False, "error": "..."}.
+    """
+    key = api_key or IMGBB_API_KEY
+    if not key:
+        return {"ok": False, "error": "Missing IMGBB_API_KEY in .env"}
+    
+    url = "https://api.imgbb.com/1/upload"
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"image": f}
+            data = {"key": key}
+            resp = requests.post(url, files=files, data=data, timeout=30)
+        result = resp.json()
+        if resp.status_code == 200 and result.get("success"):
+            image_url = result.get("data", {}).get("url")
+            if image_url:
+                return {"ok": True, "url": image_url}
+        return {"ok": False, "status": resp.status_code, "body": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
+    """
+    Публикуем пост в Farcaster через Neynar API.
+    embeds: список URL для эмбедов (например, изображения).
+    """
     if not NEYNAR_API_KEY or not NEYNAR_SIGNER_UUID:
         return {
             "ok": False,
@@ -310,6 +342,8 @@ def post_to_farcaster(text: str):
     }
     clean = clamp_to_limits(text)
     payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "text": clean}
+    if embeds:
+        payload["embeds"] = embeds
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         data = resp.json()
@@ -535,56 +569,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(text="📤 Отправка в X + Farcaster...")
 
+    # Перечитываем .env при каждом постинге — подхватим ключи после копирования .env на сервер без рестарта
+    load_dotenv(_load_env_path, override=True)
+    
     media_ids: Optional[List[str]] = None
+    farcaster_embeds: Optional[List[str]] = None
     skipped_photo_reason = None
 
     if photo_file_id:
-        # Перечитываем .env при каждом постинге — подхватим ключи после копирования .env на сервер без рестарта
-        load_dotenv(_load_env_path, override=True)
-        oauth1_key = (os.getenv("X_API_KEY") or "").strip()
-        oauth1_secret = (os.getenv("X_API_SECRET") or "").strip()
-        oauth1_token = (os.getenv("X_ACCESS_TOKEN") or "").strip()
-        oauth1_token_secret = (os.getenv("X_ACCESS_TOKEN_SECRET") or "").strip()
-        if oauth1_key and oauth1_secret and oauth1_token and oauth1_token_secret:
-            tmp_path = None
-            try:
-                tg_file = await context.bot.get_file(photo_file_id)
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    tmp_path = tmp.name
-                await tg_file.download_to_drive(custom_path=tmp_path)
-                up = upload_media_to_x(
+        tmp_path = None
+        try:
+            tg_file = await context.bot.get_file(photo_file_id)
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = tmp.name
+            await tg_file.download_to_drive(custom_path=tmp_path)
+            
+            # Загрузка для X (OAuth1)
+            oauth1_key = (os.getenv("X_API_KEY") or "").strip()
+            oauth1_secret = (os.getenv("X_API_SECRET") or "").strip()
+            oauth1_token = (os.getenv("X_ACCESS_TOKEN") or "").strip()
+            oauth1_token_secret = (os.getenv("X_ACCESS_TOKEN_SECRET") or "").strip()
+            if oauth1_key and oauth1_secret and oauth1_token and oauth1_token_secret:
+                up_x = upload_media_to_x(
                     tmp_path,
                     api_key=oauth1_key,
                     api_secret=oauth1_secret,
                     access_token=oauth1_token,
                     access_token_secret=oauth1_token_secret,
                 )
-                if up.get("ok"):
-                    media_ids = [up["media_id"]]
+                if up_x.get("ok"):
+                    media_ids = [up_x["media_id"]]
                 else:
-                    skipped_photo_reason = f"media upload failed: {up}"
-            except Exception as e:
-                skipped_photo_reason = f"telegram download/upload error: {e}"
-            finally:
-                if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-        else:
-            oauth1_status = " ".join(
-                f"{k}={('ok' if v else 'missing')}"
-                for k, v in [
-                    ("X_API_KEY", bool(oauth1_key)),
-                    ("X_API_SECRET", bool(oauth1_secret)),
-                    ("X_ACCESS_TOKEN", bool(oauth1_token)),
-                    ("X_ACCESS_TOKEN_SECRET", bool(oauth1_token_secret)),
-                ]
-            )
-            skipped_photo_reason = f"no X OAuth1 keys for media upload ({oauth1_status}). Скопируй .env на сервер (copy_env_to_server.sh), затем systemctl restart smm_bot (или просто отправь пост ещё раз — .env перечитывается при каждом нажатии)"
+                    skipped_photo_reason = f"X media upload failed: {up_x}"
+            else:
+                oauth1_status = " ".join(
+                    f"{k}={('ok' if v else 'missing')}"
+                    for k, v in [
+                        ("X_API_KEY", bool(oauth1_key)),
+                        ("X_API_SECRET", bool(oauth1_secret)),
+                        ("X_ACCESS_TOKEN", bool(oauth1_token)),
+                        ("X_ACCESS_TOKEN_SECRET", bool(oauth1_token_secret)),
+                    ]
+                )
+                skipped_photo_reason = f"no X OAuth1 keys ({oauth1_status})"
+            
+            # Загрузка для Farcaster (Imgbb)
+            imgbb_key = (os.getenv("IMGBB_API_KEY") or "").strip()
+            if imgbb_key:
+                up_fc = upload_image_to_imgbb(tmp_path, api_key=imgbb_key)
+                if up_fc.get("ok"):
+                    farcaster_embeds = [up_fc["url"]]
+                elif not skipped_photo_reason:
+                    skipped_photo_reason = f"Farcaster image upload failed: {up_fc}"
+            elif not skipped_photo_reason:
+                skipped_photo_reason = "no IMGBB_API_KEY for Farcaster images"
+        except Exception as e:
+            skipped_photo_reason = f"telegram download/upload error: {e}"
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     result_x = post_to_x(text_to_post, media_ids=media_ids)
-    result_fc = post_to_farcaster(text_to_post)
+    result_fc = post_to_farcaster(text_to_post, embeds=farcaster_embeds)
 
     lines = []
     if result_x.get("ok"):
@@ -616,6 +665,8 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
     oauth1_count = sum(1 for v in [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET] if v)
+    imgbb_status = "включена" if IMGBB_API_KEY else "отключена (добавь IMGBB_API_KEY в .env)"
     print(f"🚀 Бот @Don_Inv запущен на {MODEL_NAME}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
+    print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
     app.run_polling()

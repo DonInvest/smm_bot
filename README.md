@@ -32,7 +32,9 @@ A Telegram bot that translates your posts to English and publishes them to **X (
    - `GEMINI_API_KEY` — [Google AI Studio](https://ai.google.dev)
    - `TELEGRAM_BOT_TOKEN` — [@BotFather](https://t.me/BotFather)
    - **X**: run `python auth_x.py` once to get `X_USER_ACCESS_TOKEN` and `X_REFRESH_TOKEN`; add `X_CLIENT_ID`, `X_CLIENT_SECRET` (from [X Developer Portal](https://developer.x.com)).
+   - **X images** (optional): `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET` (OAuth1.0a from X Developer Portal).
    - **Farcaster**: `NEYNAR_API_KEY`, `NEYNAR_SIGNER_UUID` (create signer via `python auth_farcaster.py` and approve in Warpcast).
+   - **Farcaster images** (optional): `IMGBB_API_KEY` — get free API key at [imgbb.com](https://api.imgbb.com) (no registration required, just get the key).
 
 3. **Run**
    ```bash
