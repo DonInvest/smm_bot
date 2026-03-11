@@ -343,7 +343,8 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
     clean = clamp_to_limits(text)
     payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "text": clean}
     if embeds:
-        payload["embeds"] = embeds
+        # Farcaster API ожидает массив объектов с полем "url", а не просто строки
+        payload["embeds"] = [{"url": url} for url in embeds]
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         data = resp.json()
