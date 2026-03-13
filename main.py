@@ -532,8 +532,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Если не влезает — делаем 3 варианта сокращения, сохраняя инструкционный формат
-        prompt_shorten = f"""
+        # Если не влезает — делаем 3 варианта сокращения через Gemini (Grok не поддерживает множественные варианты)
+        options = []
+        if client_ai and MODEL_NAME:
+            prompt_shorten = f"""
 You are an editor and social media growth expert. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful AND adding engagement optimization.
 
 Create 3 shortening variants. For EACH option:
@@ -555,8 +557,8 @@ Full English translation to shorten:
 {translated}
 """.strip()
 
-        response2 = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_shorten)
-        options = re.findall(r"Option \d+: (.*?)(?=Option \d+:|$)", response2.text or "", re.DOTALL)
+            response2 = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_shorten)
+            options = re.findall(r"Option \d+: (.*?)(?=Option \d+:|$)", response2.text or "", re.DOTALL)
 
         if not options:
             final_text = clamp_to_limits(translated)
@@ -591,7 +593,8 @@ Full English translation to shorten:
             parse_mode="Markdown",
         )
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка Gemini: {e}")
+        ai_name = "Grok" if (USE_GROK_FOR_X and client_grok) else "Gemini"
+        await msg.edit_text(f"❌ Ошибка {ai_name}: {e}")
 
 async def process_and_upload_photo(photo_file_id, bot) -> Tuple[Optional[List[str]], Optional[List[str]], Optional[str]]:
     """
