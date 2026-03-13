@@ -2,4 +2,3 @@ python-telegram-bot[ext,job-queue]
 python-dotenv
 google-generativeai
 requests-oauthlib
-xai-sdk

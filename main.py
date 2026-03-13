@@ -154,17 +154,14 @@ FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в бай
 X_TCO_URL_LEN = 23  # приближение: X считает каждый URL как фиксированную длину
 
 # Grok (xAI) для X постов - лучше понимает алгоритм X
+# Используем OpenAI-compatible API формат
 if XAI_API_KEY:
-    try:
-        from xai_sdk import Client as XAIClient
-        client_grok = XAIClient(api_key=XAI_API_KEY)
-        GROK_MODEL = "grok-2-1212"  # или "grok-2-mini" для экономии
-    except ImportError:
-        print("⚠️ xai-sdk не установлен. Установите: pip install xai-sdk")
-        client_grok = None
-        USE_GROK_FOR_X = False
+    client_grok = XAI_API_KEY  # Сохраняем ключ для использования в запросах
+    GROK_MODEL = "grok-4-latest"  # или "grok-4-1-fast-non-reasoning" для экономии ($0.28-0.50)
+    USE_GROK_FOR_X = True
 else:
     client_grok = None
+    USE_GROK_FOR_X = False
 
 # Gemini: новый SDK (google-genai) + api_version v1 — квота у тебя на gemini-2.5-flash
 if GEMINI_KEY:
@@ -816,22 +813,46 @@ Original post:
 """.strip()
     
     try:
-        from xai_sdk.chat import system, user
-        chat = client_grok.chat.create(model=GROK_MODEL)
-        chat.append(system("You are Grok, expert at creating viral X content."))
-        chat.append(user(prompt))
-        response = chat.sample()
-        raw_translated = (response.content or "").strip()
-        translated = normalize_social_text(raw_translated)
-        translated = _avoid_cutting_url(translated)
+        # Используем OpenAI-compatible API формат
+        url = "https://api.x.ai/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {client_grok}",
+        }
+        payload = {
+            "model": GROK_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are Grok, expert at creating viral X (Twitter) content optimized for the 2025 algorithm."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+            "stream": False,
+        }
         
-        if not translated:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        data = resp.json()
+        
+        if resp.status_code == 200 and "choices" in data:
+            raw_translated = (data["choices"][0]["message"]["content"] or "").strip()
+            translated = normalize_social_text(raw_translated)
+            translated = _avoid_cutting_url(translated)
+            
+            if not translated:
+                return None
+            
+            if not fits_limits(translated):
+                translated = clamp_to_limits(translated)
+            
+            return clamp_to_limits(translated)
+        else:
+            print(f"Grok API error: {data}")
             return None
-        
-        if not fits_limits(translated):
-            translated = clamp_to_limits(translated)
-        
-        return clamp_to_limits(translated)
     except Exception as e:
         print(f"Grok translation error: {e}")
         return None
@@ -919,9 +940,14 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
             return result
         # Fallback на Gemini если Grok не сработал
         print("⚠️ Grok failed, falling back to Gemini")
+        if client_ai and MODEL_NAME:
+            return await _translate_with_gemini(text)
+        return None
     
-    # Используем Gemini
-    return await _translate_with_gemini(text)
+    # Используем Gemini для Farcaster или если Grok недоступен
+    if client_ai and MODEL_NAME:
+        return await _translate_with_gemini(text)
+    return None
 
 
 async def _post_single_section(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
@@ -1108,7 +1134,12 @@ if __name__ == '__main__':
     oauth1_count = sum(1 for v in [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET] if v)
     imgbb_status = "включена" if IMGBB_API_KEY else "отключена (добавь IMGBB_API_KEY в .env)"
     autopost_status = f"включен (каналы: {AUTOPOST_CHANNEL_IDS if AUTOPOST_CHANNEL_IDS else 'все'})" if AUTOPOST_ENABLED else "отключен"
-    ai_status = f"Grok ({GROK_MODEL})" if (USE_GROK_FOR_X and client_grok) else f"Gemini ({MODEL_NAME})" if MODEL_NAME else "не настроен"
+    if USE_GROK_FOR_X and client_grok:
+        ai_status = f"Grok ({GROK_MODEL}) для X, {'Gemini' if MODEL_NAME else 'только Grok'}"
+    elif MODEL_NAME:
+        ai_status = f"Gemini ({MODEL_NAME})"
+    else:
+        ai_status = "не настроен"
     print(f"🚀 Бот @Don_Inv запущен")
     print(f"🤖 AI для перевода: {ai_status}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
