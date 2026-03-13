@@ -137,6 +137,11 @@ AUTOPOST_ENABLED = os.getenv("AUTOPOST_ENABLED", "").strip().lower() in ("1", "t
 AUTOPOST_CHANNEL_IDS = [
     int(cid.strip()) for cid in os.getenv("AUTOPOST_CHANNEL_IDS", "").split(",") if cid.strip().isdigit()
 ]
+# ID чата для уведомлений об автопостинге (ваш личный чат с ботом или канал для логов)
+AUTOPOST_NOTIFY_CHAT_ID = None
+_notify_chat_id_str = os.getenv("AUTOPOST_NOTIFY_CHAT_ID", "").strip()
+if _notify_chat_id_str and _notify_chat_id_str.isdigit():
+    AUTOPOST_NOTIFY_CHAT_ID = int(_notify_chat_id_str)
 
 # Лимиты
 X_MAX_CHARS = 280
@@ -815,11 +820,41 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Автоматически публикуем
     result = await auto_post_to_socials(user_text, photo_file_id, context.bot)
     
-    # Логируем результат (можно добавить отправку в лог-канал или просто в консоль)
+    # Формируем сообщение о результате
+    result_x = result.get("x", {})
+    result_fc = result.get("farcaster", {})
+    
+    lines = []
+    if result_x.get("ok"):
+        lines.append("✅ X: опубликовано")
+    else:
+        err = result_x.get("error") or result_x.get("body") or result_x
+        lines.append(f"❌ X: {err}")
+    
+    if result_fc.get("ok"):
+        lines.append("✅ Farcaster: опубликовано")
+    else:
+        err = result_fc.get("error") or result_fc.get("body") or result_fc
+        lines.append(f"❌ Farcaster: {err}")
+    
+    result_msg = "\n".join(lines)
+    
+    # Логируем в консоль
     if result.get("ok"):
         print(f"✅ Автопост из канала {chat_id}: опубликовано в X/Farcaster")
     else:
         print(f"❌ Автопост из канала {chat_id}: ошибка - {result.get('error', result)}")
+    
+    # Отправляем уведомление в Telegram, если указан chat_id
+    if AUTOPOST_NOTIFY_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=AUTOPOST_NOTIFY_CHAT_ID,
+                text=f"📤 Автопост из канала:\n\n{result_msg}",
+                disable_notification=False,
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить уведомление: {e}")
 
 
 if __name__ == '__main__':
