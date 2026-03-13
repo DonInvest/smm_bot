@@ -272,12 +272,16 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
     Публикуем пост в X API v2.
     Всегда используем OAuth2 (Bearer) для твита — так не будет 401 при истёкших OAuth1.
     Фото загружаются отдельно через upload_media_to_x (OAuth1), сюда передаются уже media_ids.
+    card_uri: "tombstone://card" убирает предпросмотр ссылок (link preview cards).
     """
     url = "https://api.x.com/2/tweets"
     clean = clamp_to_limits(text)
     payload: dict = {"text": clean}
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
+    # Убираем предпросмотр ссылок - добавляем card_uri для отключения карточек
+    if _URL_RE.search(clean):
+        payload["card_uri"] = "tombstone://card"
 
     try:
         headers = {
@@ -333,7 +337,8 @@ def upload_image_to_imgbb(photo_path: str, api_key: Optional[str] = None) -> dic
 def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
     """
     Публикуем пост в Farcaster через Neynar API.
-    embeds: список URL для эмбедов (например, изображения).
+    embeds: список URL для эмбедов (только изображения, не ссылки - чтобы не было предпросмотров).
+    Ссылки остаются в тексте, но без предпросмотра карточек.
     """
     if not NEYNAR_API_KEY or not NEYNAR_SIGNER_UUID:
         return {
@@ -348,9 +353,13 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
     }
     clean = clamp_to_limits(text)
     payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "text": clean}
+    # Добавляем в embeds только изображения (не ссылки), чтобы ссылки были без предпросмотра
     if embeds:
         # Farcaster API ожидает массив объектов с полем "url", а не просто строки
-        payload["embeds"] = [{"url": url} for url in embeds]
+        # Фильтруем только изображения (imgbb URLs), ссылки остаются в тексте без предпросмотра
+        image_embeds = [{"url": url} for url in embeds if url.startswith(("https://i.", "https://i.imgbb.com", "http://i.", "http://i.imgbb.com"))]
+        if image_embeds:
+            payload["embeds"] = image_embeds
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         data = resp.json()
@@ -465,16 +474,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     prompt_translate = f"""
-You are a professional translator for instructional and list-style social posts.
+You are a professional translator and social media growth expert for crypto/tech content.
 
-Translate the user's post to English. CRITICAL rules:
+Translate the user's post to English and optimize it for maximum engagement on X (Twitter) and Farcaster. CRITICAL rules:
+
+TRANSLATION:
 - Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
-- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items. The post should look like the original, just in English.
+- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items.
 - Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
 - Do NOT add new facts, hype, or emojis. Minimal editing only.
-- Hashtags: translate meaning if needed (e.g. #база_знаний → #knowledge_base) or keep.
 
-Output ONLY the translated text, ready to be posted. Same formatting and line breaks as the original.
+ENGAGEMENT OPTIMIZATION (add at the end, 1-3 hashtags max):
+- Analyze the content topic (crypto, AI, tech, web3, DeFi, NFT, blockchain, coding, startup, etc.)
+- Add 1-3 RELEVANT hashtags from these categories (choose the most fitting):
+  * Crypto/Web3: #Crypto #Web3 #DeFi #NFT #Blockchain #Bitcoin #Ethereum #Solana #CryptoNews
+  * AI/Tech: #AI #MachineLearning #Tech #Innovation #Startup #TechNews #SoftwareDev #Coding
+  * General: #BuildInPublic #TechTwitter #CryptoTwitter #Web3 #Innovation
+- If the post mentions a specific project/token/platform, add @mention if it's a well-known account (e.g., @ethereum, @solana, @OpenAI, @VitalikButerin)
+- Only add hashtags/mentions if they genuinely fit the content - don't force them
+- Place hashtags at the end, separated by space
+- Keep total length under 280 chars for X
+
+OUTPUT FORMAT:
+Output ONLY the translated and optimized text, ready to be posted. Same formatting and line breaks as the original, with hashtags/mentions added at the end if relevant.
 
 User post:
 {user_text}
@@ -508,15 +530,17 @@ User post:
 
         # Если не влезает — делаем 3 варианта сокращения, сохраняя инструкционный формат
         prompt_shorten = f"""
-You are an editor. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful.
+You are an editor and social media growth expert. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful AND adding engagement optimization.
 
 Create 3 shortening variants. For EACH option:
 - Preserve structure: keep bullet/list format and line breaks where possible.
 - Keep as many "name (url)" links as fit; do NOT drop URLs or replace with "link" — keep real URLs.
 - No markdown symbols in output (no ** or _ or `) — target is X/Farcaster plain text.
 - Must fit: X effective length <= {X_MAX_CHARS} (each URL counts as {X_TCO_URL_LEN} chars), Farcaster <= {FARCASTER_MAX_BYTES} bytes UTF-8.
+- Add 1-3 RELEVANT hashtags at the end (crypto/tech related: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #Innovation #BuildInPublic etc.)
+- Add @mentions if relevant (well-known projects: @ethereum, @solana, @OpenAI, etc.)
 
-Options can differ by: how many list items included, short intro vs full intro, which links kept.
+Options can differ by: how many list items included, short intro vs full intro, which links kept, which hashtags/mentions added.
 
 Output EXACTLY:
 Option 1: <text>
@@ -631,18 +655,31 @@ async def auto_post_to_socials(text: str, photo_file_id: Optional[str] = None, b
     if not text:
         return {"ok": False, "error": "No text to post"}
     
-    # Переводим текст
+    # Переводим текст с оптимизацией для продвижения
     prompt_translate = f"""
-You are a professional translator for instructional and list-style social posts.
+You are a professional translator and social media growth expert for crypto/tech content.
 
-Translate the user's post to English. CRITICAL rules:
+Translate the user's post to English and optimize it for maximum engagement on X (Twitter) and Farcaster. CRITICAL rules:
+
+TRANSLATION:
 - Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
-- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items. The post should look like the original, just in English.
+- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items.
 - Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
 - Do NOT add new facts, hype, or emojis. Minimal editing only.
-- Hashtags: translate meaning if needed (e.g. #база_знаний → #knowledge_base) or keep.
 
-Output ONLY the translated text, ready to be posted. Same formatting and line breaks as the original.
+ENGAGEMENT OPTIMIZATION (add at the end, 1-3 hashtags max):
+- Analyze the content topic (crypto, AI, tech, web3, DeFi, NFT, blockchain, coding, startup, etc.)
+- Add 1-3 RELEVANT hashtags from these categories (choose the most fitting):
+  * Crypto/Web3: #Crypto #Web3 #DeFi #NFT #Blockchain #Bitcoin #Ethereum #Solana #CryptoNews
+  * AI/Tech: #AI #MachineLearning #Tech #Innovation #Startup #TechNews #SoftwareDev #Coding
+  * General: #BuildInPublic #TechTwitter #CryptoTwitter #Web3 #Innovation
+- If the post mentions a specific project/token/platform, add @mention if it's a well-known account (e.g., @ethereum, @solana, @OpenAI, @VitalikButerin)
+- Only add hashtags/mentions if they genuinely fit the content - don't force them
+- Place hashtags at the end, separated by space
+- Keep total length under 280 chars for X
+
+OUTPUT FORMAT:
+Output ONLY the translated and optimized text, ready to be posted. Same formatting and line breaks as the original, with hashtags/mentions added at the end if relevant.
 
 User post:
 {text}
@@ -657,18 +694,20 @@ User post:
         if not translated:
             return {"ok": False, "error": "Translation failed"}
         
-        # Если не влезает — сокращаем автоматически
+        # Если не влезает — сокращаем автоматически с оптимизацией
         if not fits_limits(translated):
             prompt_shorten = f"""
-You are an editor. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful.
+You are an editor and social media growth expert. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful AND adding engagement optimization.
 
 Shorten the post:
 - Preserve structure: keep bullet/list format and line breaks where possible.
 - Keep as many "name (url)" links as fit; do NOT drop URLs or replace with "link" — keep real URLs.
 - No markdown symbols in output (no ** or _ or `) — target is X/Farcaster plain text.
 - Must fit: X effective length <= {X_MAX_CHARS} (each URL counts as {X_TCO_URL_LEN} chars), Farcaster <= {FARCASTER_MAX_BYTES} bytes UTF-8.
+- Add 1-3 RELEVANT hashtags at the end (crypto/tech related: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #Innovation #BuildInPublic etc.)
+- Add @mentions if relevant (well-known projects: @ethereum, @solana, @OpenAI, etc.)
 
-Output ONLY the shortened text, ready to be posted.
+Output ONLY the shortened and optimized text, ready to be posted.
 
 Full English translation to shorten:
 {translated}
