@@ -853,9 +853,11 @@ Original post:
             if not fits_limits(translated):
                 translated = clamp_to_limits(translated)
             
-            return clamp_to_limits(translated)
+            final = clamp_to_limits(translated)
+            print(f"✅ Grok: переведено и оптимизировано ({len(final)} chars)")
+            return final
         else:
-            print(f"Grok API error: {data}")
+            print(f"❌ Grok API error: {data}")
             return None
     except Exception as e:
         print(f"Grok translation error: {e}")
@@ -929,9 +931,11 @@ Full English translation to shorten:
             else:
                 translated = clamp_to_limits(translated)
         
-        return clamp_to_limits(translated)
+        final = clamp_to_limits(translated)
+        print(f"✅ Gemini: переведено и оптимизировано ({len(final)} chars)")
+        return final
     except Exception as e:
-        print(f"Gemini translation error: {e}")
+        print(f"❌ Gemini translation error: {e}")
         return None
 
 
@@ -939,6 +943,7 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
     """Переводит одну секцию текста. Использует Grok для X постов, Gemini для остального."""
     # Для X постов используем Grok если доступен
     if for_x and USE_GROK_FOR_X and client_grok:
+        print(f"🤖 Используется Grok для перевода X поста...")
         result = await _translate_with_grok(text, for_x=True)
         if result:
             return result
@@ -950,6 +955,7 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
     
     # Используем Gemini для Farcaster или если Grok недоступен
     if client_ai and MODEL_NAME:
+        print(f"🤖 Используется Gemini для перевода...")
         return await _translate_with_gemini(text)
     return None
 
