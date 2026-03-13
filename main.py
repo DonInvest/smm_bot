@@ -24,8 +24,13 @@ def clean_token(token_name):
     # Убираем URL-кодировку, если она попала в .env
     return val.replace("%3D", "=").replace("%3d", "=")
 
+# AI для перевода: Grok (xAI) - лучше для X, Gemini - альтернатива
+XAI_API_KEY = clean_token("XAI_API_KEY")
 GEMINI_KEY = clean_token("GEMINI_API_KEY")
 TELEGRAM_TOKEN = clean_token("TELEGRAM_BOT_TOKEN")
+
+# Выбор AI: если есть XAI_API_KEY - используем Grok для X постов, иначе Gemini
+USE_GROK_FOR_X = bool(XAI_API_KEY)
 
 # OAuth 2.0 X: access + refresh (refresh нужен для автообновления при 401)
 X_USER_ACCESS_TOKEN = clean_token("X_USER_ACCESS_TOKEN")
@@ -148,12 +153,29 @@ X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
 X_TCO_URL_LEN = 23  # приближение: X считает каждый URL как фиксированную длину
 
+# Grok (xAI) для X постов - лучше понимает алгоритм X
+if XAI_API_KEY:
+    try:
+        from xai_sdk import Client as XAIClient
+        client_grok = XAIClient(api_key=XAI_API_KEY)
+        GROK_MODEL = "grok-2-1212"  # или "grok-2-mini" для экономии
+    except ImportError:
+        print("⚠️ xai-sdk не установлен. Установите: pip install xai-sdk")
+        client_grok = None
+        USE_GROK_FOR_X = False
+else:
+    client_grok = None
+
 # Gemini: новый SDK (google-genai) + api_version v1 — квота у тебя на gemini-2.5-flash
-client_ai = genai.Client(
-    api_key=GEMINI_KEY,
-    http_options=genai_types.HttpOptions(api_version="v1"),
-)
-MODEL_NAME = "gemini-2.5-flash"
+if GEMINI_KEY:
+    client_ai = genai.Client(
+        api_key=GEMINI_KEY,
+        http_options=genai_types.HttpOptions(api_version="v1"),
+    )
+    MODEL_NAME = "gemini-2.5-flash"
+else:
+    client_ai = None
+    MODEL_NAME = None
 
 
 def normalize_social_text(text: str) -> str:
@@ -485,41 +507,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await message.reply_text(
         "⏳ Перевожу на английский (сохраняю ссылки и структуру) и проверяю лимиты X + Farcaster..."
     )
-
-    prompt_translate = f"""
-You are a professional translator and social media growth expert for crypto/tech content.
-
-Translate the user's post to English and optimize it for maximum engagement on X (Twitter) and Farcaster. CRITICAL rules:
-
-TRANSLATION:
-- Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
-- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items.
-- Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
-- Do NOT add new facts, hype, or emojis. Minimal editing only.
-
-ENGAGEMENT OPTIMIZATION (add at the end, 1-3 hashtags max):
-- Analyze the content topic (crypto, AI, tech, web3, DeFi, NFT, blockchain, coding, startup, etc.)
-- Add 1-3 RELEVANT hashtags from these categories (choose the most fitting):
-  * Crypto/Web3: #Crypto #Web3 #DeFi #NFT #Blockchain #Bitcoin #Ethereum #Solana #CryptoNews
-  * AI/Tech: #AI #MachineLearning #Tech #Innovation #Startup #TechNews #SoftwareDev #Coding
-  * General: #BuildInPublic #TechTwitter #CryptoTwitter #Web3 #Innovation
-- If the post mentions a specific project/token/platform, add @mention if it's a well-known account (e.g., @ethereum, @solana, @OpenAI, @VitalikButerin)
-- Only add hashtags/mentions if they genuinely fit the content - don't force them
-- Place hashtags at the end, separated by space
-- Keep total length under 280 chars for X
-
-OUTPUT FORMAT:
-Output ONLY the translated and optimized text, ready to be posted. Same formatting and line breaks as the original, with hashtags/mentions added at the end if relevant.
-
-User post:
-{user_text}
-""".strip()
     
     try:
-        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_translate)
-        raw_translated = (response.text or "").strip()
-        translated = normalize_social_text(raw_translated)
-        translated = _avoid_cutting_url(translated)
+        # Используем Grok для X постов если доступен, иначе Gemini
+        translated = await _translate_section(user_text, for_x=True)
 
         if not translated:
             await msg.edit_text("❌ Не смог получить перевод. Попробуй ещё раз.")
@@ -732,10 +723,10 @@ async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = No
     """
     load_dotenv(_load_env_path, override=True)
     
-    # Переводим все секции
+    # Переводим все секции (для X используем Grok если доступен)
     translated_sections = []
     for section in sections:
-        translated = await _translate_section(section)
+        translated = await _translate_section(section, for_x=True)
         if translated:
             translated_sections.append(translated)
     
@@ -788,8 +779,66 @@ async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = No
     }
 
 
-async def _translate_section(text: str) -> Optional[str]:
-    """Переводит одну секцию текста."""
+async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
+    """Переводит текст используя Grok (xAI) - оптимизировано для алгоритма X 2025."""
+    if not client_grok:
+        return None
+    
+    prompt = f"""
+You are Grok, an expert at creating viral X (Twitter) content optimized for the 2025 algorithm.
+
+CRITICAL X ALGORITHM OPTIMIZATION (2025):
+1. ENGAGEMENT VELOCITY: First 60 minutes are critical. Add hooks that prompt immediate replies/questions.
+2. REPLIES > LIKES: End with a question or controversial statement that provokes discussion.
+3. SPECIFICITY: Use concrete details, numbers, specific examples instead of vague statements.
+4. CONVERSATION STARTERS: Frame content to invite replies, not just passive consumption.
+
+TRANSLATION RULES:
+- Translate from Russian to English naturally
+- Preserve ALL URLs exactly: "link_text (https://...)" format
+- Keep structure: bullets, line breaks, numbered lists
+- Remove markdown (** _ `) - X doesn't render it well
+
+VIRAL OPTIMIZATION:
+- Add 1-2 RELEVANT hashtags: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
+- Add @mentions for well-known projects: @ethereum @solana @OpenAI @VitalikButerin
+- End with a question or call-to-action to drive replies (critical for algorithm)
+- Use specific numbers, metrics, concrete examples
+- Make it conversational and engaging, not corporate
+
+OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. No explanations.
+
+Original post:
+{text}
+""".strip()
+    
+    try:
+        from xai_sdk.chat import system, user
+        chat = client_grok.chat.create(model=GROK_MODEL)
+        chat.append(system("You are Grok, expert at creating viral X content."))
+        chat.append(user(prompt))
+        response = chat.sample()
+        raw_translated = (response.content or "").strip()
+        translated = normalize_social_text(raw_translated)
+        translated = _avoid_cutting_url(translated)
+        
+        if not translated:
+            return None
+        
+        if not fits_limits(translated):
+            translated = clamp_to_limits(translated)
+        
+        return clamp_to_limits(translated)
+    except Exception as e:
+        print(f"Grok translation error: {e}")
+        return None
+
+
+async def _translate_with_gemini(text: str) -> Optional[str]:
+    """Переводит текст используя Gemini (fallback)."""
+    if not client_ai or not MODEL_NAME:
+        return None
+    
     prompt_translate = f"""
 You are a professional translator and social media growth expert for crypto/tech content.
 
@@ -828,7 +877,6 @@ User post:
         if not translated:
             return None
         
-        # Если не влезает — сокращаем
         if not fits_limits(translated):
             prompt_shorten = f"""
 You are an editor and social media growth expert. Shorten the post to fit platform limits while keeping it useful AND adding engagement optimization.
@@ -855,81 +903,39 @@ Full English translation to shorten:
         
         return clamp_to_limits(translated)
     except Exception as e:
-        print(f"Translation error: {e}")
+        print(f"Gemini translation error: {e}")
         return None
+
+
+async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
+    """Переводит одну секцию текста. Использует Grok для X постов, Gemini для остального."""
+    # Для X постов используем Grok если доступен
+    if for_x and USE_GROK_FOR_X and client_grok:
+        result = await _translate_with_grok(text, for_x=True)
+        if result:
+            return result
+        # Fallback на Gemini если Grok не сработал
+        print("⚠️ Grok failed, falling back to Gemini")
+    
+    # Используем Gemini
+    return await _translate_with_gemini(text)
 
 
 async def _post_single_section(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
     """
     Публикует одну секцию поста (вспомогательная функция).
+    Использует Grok для X постов если доступен.
     """
     
-    # Переводим текст с оптимизацией для продвижения
-    prompt_translate = f"""
-You are a professional translator and social media growth expert for crypto/tech content.
-
-Translate the user's post to English and optimize it for maximum engagement on X (Twitter) and Farcaster. CRITICAL rules:
-
-TRANSLATION:
-- Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
-- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items.
-- Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
-- Do NOT add new facts, hype, or emojis. Minimal editing only.
-
-ENGAGEMENT OPTIMIZATION (add at the end, 1-3 hashtags max):
-- Analyze the content topic (crypto, AI, tech, web3, DeFi, NFT, blockchain, coding, startup, etc.)
-- Add 1-3 RELEVANT hashtags from these categories (choose the most fitting):
-  * Crypto/Web3: #Crypto #Web3 #DeFi #NFT #Blockchain #Bitcoin #Ethereum #Solana #CryptoNews
-  * AI/Tech: #AI #MachineLearning #Tech #Innovation #Startup #TechNews #SoftwareDev #Coding
-  * General: #BuildInPublic #TechTwitter #CryptoTwitter #Web3 #Innovation
-- If the post mentions a specific project/token/platform, add @mention if it's a well-known account (e.g., @ethereum, @solana, @OpenAI, @VitalikButerin)
-- Only add hashtags/mentions if they genuinely fit the content - don't force them
-- Place hashtags at the end, separated by space
-- Keep total length under 280 chars for X
-
-OUTPUT FORMAT:
-Output ONLY the translated and optimized text, ready to be posted. Same formatting and line breaks as the original, with hashtags/mentions added at the end if relevant.
-
-User post:
-{text}
-""".strip()
+    # Переводим текст (Grok для X, Gemini для остального)
+    translated = await _translate_section(text, for_x=True)
+    
+    if not translated:
+        return {"ok": False, "error": "Translation failed"}
+    
+    final_text = clamp_to_limits(translated)
     
     try:
-        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_translate)
-        raw_translated = (response.text or "").strip()
-        translated = normalize_social_text(raw_translated)
-        translated = _avoid_cutting_url(translated)
-        
-        if not translated:
-            return {"ok": False, "error": "Translation failed"}
-        
-        # Если не влезает — сокращаем автоматически с оптимизацией
-        if not fits_limits(translated):
-            prompt_shorten = f"""
-You are an editor and social media growth expert. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful AND adding engagement optimization.
-
-Shorten the post:
-- Preserve structure: keep bullet/list format and line breaks where possible.
-- Keep as many "name (url)" links as fit; do NOT drop URLs or replace with "link" — keep real URLs.
-- No markdown symbols in output (no ** or _ or `) — target is X/Farcaster plain text.
-- Must fit: X effective length <= {X_MAX_CHARS} (each URL counts as {X_TCO_URL_LEN} chars), Farcaster <= {FARCASTER_MAX_BYTES} bytes UTF-8.
-- Add 1-3 RELEVANT hashtags at the end (crypto/tech related: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #Innovation #BuildInPublic etc.)
-- Add @mentions if relevant (well-known projects: @ethereum, @solana, @OpenAI, etc.)
-
-Output ONLY the shortened and optimized text, ready to be posted.
-
-Full English translation to shorten:
-{translated}
-""".strip()
-            response2 = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_shorten)
-            shortened = (response2.text or "").strip()
-            if shortened:
-                translated = clamp_to_limits(shortened)
-            else:
-                translated = clamp_to_limits(translated)
-        
-        final_text = clamp_to_limits(translated)
-        
         # Загружаем фото если есть
         media_ids = None
         farcaster_embeds = None
@@ -1099,7 +1105,9 @@ if __name__ == '__main__':
     oauth1_count = sum(1 for v in [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET] if v)
     imgbb_status = "включена" if IMGBB_API_KEY else "отключена (добавь IMGBB_API_KEY в .env)"
     autopost_status = f"включен (каналы: {AUTOPOST_CHANNEL_IDS if AUTOPOST_CHANNEL_IDS else 'все'})" if AUTOPOST_ENABLED else "отключен"
-    print(f"🚀 Бот @Don_Inv запущен на {MODEL_NAME}")
+    ai_status = f"Grok ({GROK_MODEL})" if (USE_GROK_FOR_X and client_grok) else f"Gemini ({MODEL_NAME})" if MODEL_NAME else "не настроен"
+    print(f"🚀 Бот @Don_Inv запущен")
+    print(f"🤖 AI для перевода: {ai_status}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
     print(f"🤖 Автопостинг из каналов: {autopost_status}")
