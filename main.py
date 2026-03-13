@@ -132,6 +132,12 @@ NEYNAR_SIGNER_UUID = clean_token("NEYNAR_SIGNER_UUID")
 # Imgbb для загрузки изображений в Farcaster (альтернатива Imgur)
 IMGBB_API_KEY = clean_token("IMGBB_API_KEY")
 
+# Автопостинг из каналов
+AUTOPOST_ENABLED = os.getenv("AUTOPOST_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+AUTOPOST_CHANNEL_IDS = [
+    int(cid.strip()) for cid in os.getenv("AUTOPOST_CHANNEL_IDS", "").split(",") if cid.strip().isdigit()
+]
+
 # Лимиты
 X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
@@ -559,6 +565,144 @@ Full English translation to shorten:
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка Gemini: {e}")
 
+async def process_and_upload_photo(photo_file_id, bot) -> Tuple[Optional[List[str]], Optional[List[str]], Optional[str]]:
+    """
+    Загружает фото из Telegram и загружает в X и Farcaster.
+    Возвращает (media_ids для X, embeds для Farcaster, ошибка если есть).
+    """
+    if not photo_file_id:
+        return None, None, None
+    
+    load_dotenv(_load_env_path, override=True)
+    media_ids: Optional[List[str]] = None
+    farcaster_embeds: Optional[List[str]] = None
+    skipped_photo_reason = None
+    tmp_path = None
+    
+    try:
+        tg_file = await bot.get_file(photo_file_id)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(custom_path=tmp_path)
+        
+        # Загрузка для X (OAuth1)
+        oauth1_key = (os.getenv("X_API_KEY") or "").strip()
+        oauth1_secret = (os.getenv("X_API_SECRET") or "").strip()
+        oauth1_token = (os.getenv("X_ACCESS_TOKEN") or "").strip()
+        oauth1_token_secret = (os.getenv("X_ACCESS_TOKEN_SECRET") or "").strip()
+        if oauth1_key and oauth1_secret and oauth1_token and oauth1_token_secret:
+            up_x = upload_media_to_x(
+                tmp_path,
+                api_key=oauth1_key,
+                api_secret=oauth1_secret,
+                access_token=oauth1_token,
+                access_token_secret=oauth1_token_secret,
+            )
+            if up_x.get("ok"):
+                media_ids = [up_x["media_id"]]
+            else:
+                skipped_photo_reason = f"X media upload failed: {up_x}"
+        
+        # Загрузка для Farcaster (Imgbb)
+        imgbb_key = (os.getenv("IMGBB_API_KEY") or "").strip()
+        if imgbb_key:
+            up_fc = upload_image_to_imgbb(tmp_path, api_key=imgbb_key)
+            if up_fc.get("ok"):
+                farcaster_embeds = [up_fc["url"]]
+            elif not skipped_photo_reason:
+                skipped_photo_reason = f"Farcaster image upload failed: {up_fc}"
+    except Exception as e:
+        skipped_photo_reason = f"telegram download/upload error: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    
+    return media_ids, farcaster_embeds, skipped_photo_reason
+
+
+async def auto_post_to_socials(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
+    """
+    Автоматически переводит текст и публикует в X + Farcaster без кнопок.
+    Используется для автопостинга из каналов.
+    """
+    if not text:
+        return {"ok": False, "error": "No text to post"}
+    
+    # Переводим текст
+    prompt_translate = f"""
+You are a professional translator for instructional and list-style social posts.
+
+Translate the user's post to English. CRITICAL rules:
+- Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
+- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items. The post should look like the original, just in English.
+- Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
+- Do NOT add new facts, hype, or emojis. Minimal editing only.
+- Hashtags: translate meaning if needed (e.g. #база_знаний → #knowledge_base) or keep.
+
+Output ONLY the translated text, ready to be posted. Same formatting and line breaks as the original.
+
+User post:
+{text}
+""".strip()
+    
+    try:
+        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_translate)
+        raw_translated = (response.text or "").strip()
+        translated = normalize_social_text(raw_translated)
+        translated = _avoid_cutting_url(translated)
+        
+        if not translated:
+            return {"ok": False, "error": "Translation failed"}
+        
+        # Если не влезает — сокращаем автоматически
+        if not fits_limits(translated):
+            prompt_shorten = f"""
+You are an editor. The post is instructional (list, links, tips). Shorten it to fit platform limits while keeping it useful.
+
+Shorten the post:
+- Preserve structure: keep bullet/list format and line breaks where possible.
+- Keep as many "name (url)" links as fit; do NOT drop URLs or replace with "link" — keep real URLs.
+- No markdown symbols in output (no ** or _ or `) — target is X/Farcaster plain text.
+- Must fit: X effective length <= {X_MAX_CHARS} (each URL counts as {X_TCO_URL_LEN} chars), Farcaster <= {FARCASTER_MAX_BYTES} bytes UTF-8.
+
+Output ONLY the shortened text, ready to be posted.
+
+Full English translation to shorten:
+{translated}
+""".strip()
+            response2 = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_shorten)
+            shortened = (response2.text or "").strip()
+            if shortened:
+                translated = clamp_to_limits(shortened)
+            else:
+                translated = clamp_to_limits(translated)
+        
+        final_text = clamp_to_limits(translated)
+        
+        # Загружаем фото если есть
+        media_ids = None
+        farcaster_embeds = None
+        if photo_file_id and bot:
+            media_ids, farcaster_embeds, _ = await process_and_upload_photo(photo_file_id, bot)
+        
+        # Публикуем
+        load_dotenv(_load_env_path, override=True)
+        result_x = post_to_x(final_text, media_ids=media_ids)
+        result_fc = post_to_farcaster(final_text, embeds=farcaster_embeds)
+        
+        return {
+            "ok": result_x.get("ok") or result_fc.get("ok"),
+            "x": result_x,
+            "farcaster": result_fc,
+            "text": final_text,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -570,69 +714,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(text="📤 Отправка в X + Farcaster...")
 
-    # Перечитываем .env при каждом постинге — подхватим ключи после копирования .env на сервер без рестарта
+    # Используем общую функцию для загрузки фото
+    media_ids, farcaster_embeds, skipped_photo_reason = await process_and_upload_photo(
+        photo_file_id, context.bot
+    )
+
     load_dotenv(_load_env_path, override=True)
-    
-    media_ids: Optional[List[str]] = None
-    farcaster_embeds: Optional[List[str]] = None
-    skipped_photo_reason = None
-
-    if photo_file_id:
-        tmp_path = None
-        try:
-            tg_file = await context.bot.get_file(photo_file_id)
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                tmp_path = tmp.name
-            await tg_file.download_to_drive(custom_path=tmp_path)
-            
-            # Загрузка для X (OAuth1)
-            oauth1_key = (os.getenv("X_API_KEY") or "").strip()
-            oauth1_secret = (os.getenv("X_API_SECRET") or "").strip()
-            oauth1_token = (os.getenv("X_ACCESS_TOKEN") or "").strip()
-            oauth1_token_secret = (os.getenv("X_ACCESS_TOKEN_SECRET") or "").strip()
-            if oauth1_key and oauth1_secret and oauth1_token and oauth1_token_secret:
-                up_x = upload_media_to_x(
-                    tmp_path,
-                    api_key=oauth1_key,
-                    api_secret=oauth1_secret,
-                    access_token=oauth1_token,
-                    access_token_secret=oauth1_token_secret,
-                )
-                if up_x.get("ok"):
-                    media_ids = [up_x["media_id"]]
-                else:
-                    skipped_photo_reason = f"X media upload failed: {up_x}"
-            else:
-                oauth1_status = " ".join(
-                    f"{k}={('ok' if v else 'missing')}"
-                    for k, v in [
-                        ("X_API_KEY", bool(oauth1_key)),
-                        ("X_API_SECRET", bool(oauth1_secret)),
-                        ("X_ACCESS_TOKEN", bool(oauth1_token)),
-                        ("X_ACCESS_TOKEN_SECRET", bool(oauth1_token_secret)),
-                    ]
-                )
-                skipped_photo_reason = f"no X OAuth1 keys ({oauth1_status})"
-            
-            # Загрузка для Farcaster (Imgbb)
-            imgbb_key = (os.getenv("IMGBB_API_KEY") or "").strip()
-            if imgbb_key:
-                up_fc = upload_image_to_imgbb(tmp_path, api_key=imgbb_key)
-                if up_fc.get("ok"):
-                    farcaster_embeds = [up_fc["url"]]
-                elif not skipped_photo_reason:
-                    skipped_photo_reason = f"Farcaster image upload failed: {up_fc}"
-            elif not skipped_photo_reason:
-                skipped_photo_reason = "no IMGBB_API_KEY for Farcaster images"
-        except Exception as e:
-            skipped_photo_reason = f"telegram download/upload error: {e}"
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
     result_x = post_to_x(text_to_post, media_ids=media_ids)
     result_fc = post_to_farcaster(text_to_post, embeds=farcaster_embeds)
 
@@ -661,13 +748,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("\nТекст:\n" + text_to_post)
     await query.edit_message_text(text="\n".join(lines))
 
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик постов из каналов для автопостинга."""
+    if not AUTOPOST_ENABLED:
+        return
+    
+    # channel_post может быть в update.channel_post или update.edited_channel_post
+    channel_post = update.channel_post or update.edited_channel_post
+    if not channel_post:
+        return
+    
+    chat_id = channel_post.chat.id
+    # Если указаны конкретные каналы — проверяем
+    if AUTOPOST_CHANNEL_IDS and chat_id not in AUTOPOST_CHANNEL_IDS:
+        return
+    
+    # Игнорируем посты от самого бота (чтобы избежать циклов)
+    if channel_post.from_user and channel_post.from_user.is_bot:
+        return
+    
+    user_text, photos = extract_text_and_photos(channel_post)
+    if not user_text:
+        return
+    
+    photo_file_id = photos[-1].file_id if photos else None
+    
+    # Автоматически публикуем
+    result = await auto_post_to_socials(user_text, photo_file_id, context.bot)
+    
+    # Логируем результат (можно добавить отправку в лог-канал или просто в консоль)
+    if result.get("ok"):
+        print(f"✅ Автопост из канала {chat_id}: опубликовано в X/Farcaster")
+    else:
+        print(f"❌ Автопост из канала {chat_id}: ошибка - {result.get('error', result)}")
+
+
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Обработчик для постов из каналов (автопостинг)
+    if AUTOPOST_ENABLED:
+        from telegram.ext import filters as tg_filters
+        app.add_handler(MessageHandler(tg_filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
+    
     oauth1_count = sum(1 for v in [X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET] if v)
     imgbb_status = "включена" if IMGBB_API_KEY else "отключена (добавь IMGBB_API_KEY в .env)"
+    autopost_status = f"включен (каналы: {AUTOPOST_CHANNEL_IDS if AUTOPOST_CHANNEL_IDS else 'все'})" if AUTOPOST_ENABLED else "отключен"
     print(f"🚀 Бот @Don_Inv запущен на {MODEL_NAME}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
+    print(f"🤖 Автопостинг из каналов: {autopost_status}")
     app.run_polling()
