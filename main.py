@@ -272,12 +272,13 @@ def upload_media_to_x(
         return {"ok": False, "error": str(e)}
 
 
-def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
+def post_to_x(text: str, media_ids: Optional[List[str]] = None, reply_to_tweet_id: Optional[str] = None) -> dict:
     """
     Публикуем пост в X API v2.
     Всегда используем OAuth2 (Bearer) для твита — так не будет 401 при истёкших OAuth1.
     Фото загружаются отдельно через upload_media_to_x (OAuth1), сюда передаются уже media_ids.
     card_uri: "tombstone://card" убирает предпросмотр ссылок (link preview cards).
+    reply_to_tweet_id: ID твита для ответа (создание треда).
     """
     url = "https://api.x.com/2/tweets"
     clean = clamp_to_limits(text)
@@ -287,6 +288,9 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None) -> dict:
     # Убираем предпросмотр ссылок - добавляем card_uri для отключения карточек
     if _URL_RE.search(clean):
         payload["card_uri"] = "tombstone://card"
+    # Если это ответ в треде - добавляем reply
+    if reply_to_tweet_id:
+        payload["reply"] = {"in_reply_to_tweet_id": reply_to_tweet_id}
 
     try:
         headers = {
@@ -339,11 +343,12 @@ def upload_image_to_imgbb(photo_path: str, api_key: Optional[str] = None) -> dic
         return {"ok": False, "error": str(e)}
 
 
-def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
+def post_to_farcaster(text: str, embeds: Optional[List[str]] = None, reply_to_hash: Optional[str] = None):
     """
     Публикуем пост в Farcaster через Neynar API.
     embeds: список URL для эмбедов (только изображения, не ссылки - чтобы не было предпросмотров).
     Ссылки остаются в тексте, но без предпросмотра карточек.
+    reply_to_hash: hash родительского каста для ответа (создание треда).
     """
     if not NEYNAR_API_KEY or not NEYNAR_SIGNER_UUID:
         return {
@@ -365,12 +370,15 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None):
         image_embeds = [{"url": url} for url in embeds if url.startswith(("https://i.", "https://i.imgbb.com", "http://i.", "http://i.imgbb.com"))]
         if image_embeds:
             payload["embeds"] = image_embeds
+    # Если это ответ в треде - добавляем reply_to
+    if reply_to_hash:
+        payload["reply_to"] = reply_to_hash
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         data = resp.json()
         if resp.status_code == 200 and data.get("success"):
             cast_hash = (data.get("cast") or {}).get("hash")
-            return {"ok": True, "hash": cast_hash}
+            return {"ok": True, "hash": cast_hash, "cast": data.get("cast")}
         return {"ok": False, "status": resp.status_code, "body": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -652,13 +660,209 @@ async def process_and_upload_photo(photo_file_id, bot) -> Tuple[Optional[List[st
     return media_ids, farcaster_embeds, skipped_photo_reason
 
 
+def split_long_post(text: str) -> List[str]:
+    """
+    Разбивает длинный пост на несколько постов по пунктам/секциям.
+    Используется для постов с множеством отдельных тем (например, список проектов).
+    """
+    # Ищем маркеры разделения: •, -, *, цифры с точкой, заголовки в **
+    lines = text.split('\n')
+    sections = []
+    current_section = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        # Определяем начало новой секции
+        is_section_start = (
+            line_stripped.startswith(('•', '-', '*', '·')) or
+            re.match(r'^\d+[\.\)]\s+', line_stripped) or
+            (line_stripped.startswith('**') and line_stripped.endswith('**') and len(line_stripped) < 50)
+        )
+        
+        if is_section_start and current_section:
+            # Сохраняем предыдущую секцию
+            section_text = '\n'.join(current_section).strip()
+            if section_text and len(section_text) > 20:  # Минимальная длина секции
+                sections.append(section_text)
+            current_section = [line]
+        else:
+            current_section.append(line)
+    
+    # Добавляем последнюю секцию
+    if current_section:
+        section_text = '\n'.join(current_section).strip()
+        if section_text and len(section_text) > 20:
+            sections.append(section_text)
+    
+    # Если разбиение не удалось или получилось слишком много мелких частей - возвращаем исходный текст
+    if len(sections) > 10 or len(sections) == 0:
+        return [text]
+    
+    return sections
+
+
 async def auto_post_to_socials(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
     """
     Автоматически переводит текст и публикует в X + Farcaster без кнопок.
     Используется для автопостинга из каналов.
+    Если пост очень длинный - разбивает на тред (thread) с ответами.
     """
     if not text:
         return {"ok": False, "error": "No text to post"}
+    
+    # Проверяем, нужно ли разбивать пост (если он явно длинный и структурированный)
+    text_length = len(text.encode('utf-8'))
+    should_split = text_length > 500 and ('•' in text or '\n-' in text or re.search(r'^\d+[\.\)]', text, re.MULTILINE))
+    
+    if should_split:
+        # Разбиваем на секции
+        sections = split_long_post(text)
+        if len(sections) > 1:
+            # Публикуем как тред (thread)
+            return await _post_as_thread(sections, photo_file_id, bot)
+    
+    # Обычная публикация одного поста
+    return await _post_single_section(text, photo_file_id, bot)
+
+
+async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = None, bot=None) -> dict:
+    """
+    Публикует несколько секций как тред (thread) в X и Farcaster.
+    Первый пост - основной, остальные - ответы с задержкой 2-3 секунды.
+    """
+    load_dotenv(_load_env_path, override=True)
+    
+    # Переводим все секции
+    translated_sections = []
+    for section in sections:
+        translated = await _translate_section(section)
+        if translated:
+            translated_sections.append(translated)
+    
+    if not translated_sections:
+        return {"ok": False, "error": "Translation failed"}
+    
+    # Публикуем первый пост
+    first_section = translated_sections[0]
+    media_ids = None
+    farcaster_embeds = None
+    
+    if photo_file_id and bot:
+        media_ids, farcaster_embeds, _ = await process_and_upload_photo(photo_file_id, bot)
+    
+    result_x = post_to_x(first_section, media_ids=media_ids)
+    result_fc = post_to_farcaster(first_section, embeds=farcaster_embeds)
+    
+    x_thread_id = result_x.get("id") if result_x.get("ok") else None
+    fc_thread_hash = result_fc.get("hash") if result_fc.get("ok") else None
+    
+    # Публикуем остальные посты как ответы с задержкой
+    x_replies = [result_x] if result_x.get("ok") else []
+    fc_replies = [result_fc] if result_fc.get("ok") else []
+    
+    for i, section in enumerate(translated_sections[1:], start=1):
+        # Задержка 2-3 секунды между постами (чтобы не триггерить rate limits)
+        await asyncio.sleep(2.5)
+        
+        if x_thread_id:
+            x_reply = post_to_x(section, reply_to_tweet_id=x_thread_id)
+            x_replies.append(x_reply)
+            if x_reply.get("ok"):
+                x_thread_id = x_reply.get("id")  # Обновляем для следующего ответа
+        
+        if fc_thread_hash:
+            fc_reply = post_to_farcaster(section, reply_to_hash=fc_thread_hash)
+            fc_replies.append(fc_reply)
+            if fc_reply.get("ok"):
+                fc_thread_hash = fc_reply.get("hash")  # Обновляем для следующего ответа
+    
+    x_success = sum(1 for r in x_replies if r.get("ok"))
+    fc_success = sum(1 for r in fc_replies if r.get("ok"))
+    
+    return {
+        "ok": x_success > 0 or fc_success > 0,
+        "thread": True,
+        "posts_count": len(translated_sections),
+        "x": {"success": x_success, "total": len(x_replies), "replies": x_replies},
+        "farcaster": {"success": fc_success, "total": len(fc_replies), "replies": fc_replies},
+    }
+
+
+async def _translate_section(text: str) -> Optional[str]:
+    """Переводит одну секцию текста."""
+    prompt_translate = f"""
+You are a professional translator and social media growth expert for crypto/tech content.
+
+Translate the user's post to English and optimize it for maximum engagement on X (Twitter) and Farcaster. CRITICAL rules:
+
+TRANSLATION:
+- Preserve ALL URLs exactly: they appear as "link_text (https://...)". Keep every URL in the same form "translated_label (same_url)".
+- Preserve structure: title, bullet lists (• or -), line breaks, paragraphs, numbered items.
+- Keep **bold**, _italic_, `code` markers if present — they mark emphasis/structure.
+- Do NOT add new facts, hype, or emojis. Minimal editing only.
+
+ENGAGEMENT OPTIMIZATION (add at the end, 1-3 hashtags max):
+- Analyze the content topic (crypto, AI, tech, web3, DeFi, NFT, blockchain, coding, startup, etc.)
+- Add 1-3 RELEVANT hashtags from these categories (choose the most fitting):
+  * Crypto/Web3: #Crypto #Web3 #DeFi #NFT #Blockchain #Bitcoin #Ethereum #Solana #CryptoNews
+  * AI/Tech: #AI #MachineLearning #Tech #Innovation #Startup #TechNews #SoftwareDev #Coding
+  * General: #BuildInPublic #TechTwitter #CryptoTwitter #Web3 #Innovation
+- If the post mentions a specific project/token/platform, add @mention if it's a well-known account (e.g., @ethereum, @solana, @OpenAI, @VitalikButerin)
+- Only add hashtags/mentions if they genuinely fit the content - don't force them
+- Place hashtags at the end, separated by space
+- Keep total length under 280 chars for X
+
+OUTPUT FORMAT:
+Output ONLY the translated and optimized text, ready to be posted. Same formatting and line breaks as the original, with hashtags/mentions added at the end if relevant.
+
+User post:
+{text}
+""".strip()
+    
+    try:
+        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_translate)
+        raw_translated = (response.text or "").strip()
+        translated = normalize_social_text(raw_translated)
+        translated = _avoid_cutting_url(translated)
+        
+        if not translated:
+            return None
+        
+        # Если не влезает — сокращаем
+        if not fits_limits(translated):
+            prompt_shorten = f"""
+You are an editor and social media growth expert. Shorten the post to fit platform limits while keeping it useful AND adding engagement optimization.
+
+Shorten the post:
+- Preserve structure: keep bullet/list format and line breaks where possible.
+- Keep as many "name (url)" links as fit; do NOT drop URLs or replace with "link" — keep real URLs.
+- No markdown symbols in output (no ** or _ or `) — target is X/Farcaster plain text.
+- Must fit: X effective length <= {X_MAX_CHARS} (each URL counts as {X_TCO_URL_LEN} chars), Farcaster <= {FARCASTER_MAX_BYTES} bytes UTF-8.
+- Add 1-3 RELEVANT hashtags at the end (crypto/tech related: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #Innovation #BuildInPublic etc.)
+- Add @mentions if relevant (well-known projects: @ethereum, @solana, @OpenAI, etc.)
+
+Output ONLY the shortened and optimized text, ready to be posted.
+
+Full English translation to shorten:
+{translated}
+""".strip()
+            response2 = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_shorten)
+            shortened = (response2.text or "").strip()
+            if shortened:
+                translated = clamp_to_limits(shortened)
+            else:
+                translated = clamp_to_limits(translated)
+        
+        return clamp_to_limits(translated)
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return None
+
+
+async def _post_single_section(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
+    """
+    Публикует одну секцию поста (вспомогательная функция).
+    """
     
     # Переводим текст с оптимизацией для продвижения
     prompt_translate = f"""
@@ -821,21 +1025,46 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     result = await auto_post_to_socials(user_text, photo_file_id, context.bot)
     
     # Формируем сообщение о результате
-    result_x = result.get("x", {})
-    result_fc = result.get("farcaster", {})
+    is_thread = result.get("thread", False)
     
-    lines = []
-    if result_x.get("ok"):
-        lines.append("✅ X: опубликовано")
+    if is_thread:
+        # Результат треда
+        posts_count = result.get("posts_count", 0)
+        x_info = result.get("x", {})
+        fc_info = result.get("farcaster", {})
+        
+        lines = [f"🧵 Тред из {posts_count} постов:"]
+        
+        x_success = x_info.get("success", 0)
+        x_total = x_info.get("total", 0)
+        if x_success > 0:
+            lines.append(f"✅ X: {x_success}/{x_total} постов опубликовано")
+        else:
+            lines.append(f"❌ X: не удалось опубликовать")
+        
+        fc_success = fc_info.get("success", 0)
+        fc_total = fc_info.get("total", 0)
+        if fc_success > 0:
+            lines.append(f"✅ Farcaster: {fc_success}/{fc_total} постов опубликовано")
+        else:
+            lines.append(f"❌ Farcaster: не удалось опубликовать")
     else:
-        err = result_x.get("error") or result_x.get("body") or result_x
-        lines.append(f"❌ X: {err}")
-    
-    if result_fc.get("ok"):
-        lines.append("✅ Farcaster: опубликовано")
-    else:
-        err = result_fc.get("error") or result_fc.get("body") or result_fc
-        lines.append(f"❌ Farcaster: {err}")
+        # Обычный пост
+        result_x = result.get("x", {})
+        result_fc = result.get("farcaster", {})
+        
+        lines = []
+        if result_x.get("ok"):
+            lines.append("✅ X: опубликовано")
+        else:
+            err = result_x.get("error") or result_x.get("body") or result_x
+            lines.append(f"❌ X: {err}")
+        
+        if result_fc.get("ok"):
+            lines.append("✅ Farcaster: опубликовано")
+        else:
+            err = result_fc.get("error") or result_fc.get("body") or result_fc
+            lines.append(f"❌ Farcaster: {err}")
     
     result_msg = "\n".join(lines)
     
