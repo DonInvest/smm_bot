@@ -785,13 +785,16 @@ async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
         return None
     
     prompt = f"""
-You are Grok, an expert at creating viral X (Twitter) content optimized for the 2025 algorithm.
+You are Grok, an expert at creating viral X (Twitter) content optimized for MAXIMUM VIEWS and COMMENTS in 2025.
+
+PRIMARY GOAL: Maximize views and comments, not hashtags. Hashtags are OPTIONAL - only add if they genuinely boost discoverability.
 
 CRITICAL X ALGORITHM OPTIMIZATION (2025):
 1. ENGAGEMENT VELOCITY: First 60 minutes are critical. Add hooks that prompt immediate replies/questions.
-2. REPLIES > LIKES: End with a question or controversial statement that provokes discussion.
+2. REPLIES > LIKES: End with a question, controversial statement, or call-to-action that provokes discussion.
 3. SPECIFICITY: Use concrete details, numbers, specific examples instead of vague statements.
 4. CONVERSATION STARTERS: Frame content to invite replies, not just passive consumption.
+5. CONTROVERSY & DEBATE: If appropriate, add elements that spark discussion (but stay truthful).
 
 TRANSLATION RULES:
 - Translate from Russian to English naturally
@@ -799,14 +802,15 @@ TRANSLATION RULES:
 - Keep structure: bullets, line breaks, numbered lists
 - Remove markdown (** _ `) - X doesn't render it well
 
-VIRAL OPTIMIZATION:
-- Add 1-2 RELEVANT hashtags: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
-- Add @mentions for well-known projects: @ethereum @solana @OpenAI @VitalikButerin
-- End with a question or call-to-action to drive replies (critical for algorithm)
+VIRAL OPTIMIZATION (focus on views & comments):
+- END WITH A QUESTION or controversial statement to drive replies (CRITICAL - this is more important than hashtags)
 - Use specific numbers, metrics, concrete examples
-- Make it conversational and engaging, not corporate
+- Make it conversational, engaging, and debate-worthy
+- Add @mentions ONLY for well-known projects if relevant: @ethereum @solana @OpenAI @VitalikButerin
+- HASHTAGS: Add ONLY if they genuinely help discoverability AND don't hurt readability. Skip hashtags if the tweet is already strong without them. If adding, use 1-2 max: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
+- Prioritize engagement hooks over hashtags - a question at the end is worth more than 5 hashtags
 
-OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. No explanations.
+OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. Focus on driving comments and views, not hashtag stuffing. No explanations.
 
 Original post:
 {text}
