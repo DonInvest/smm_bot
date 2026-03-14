@@ -139,9 +139,16 @@ IMGBB_API_KEY = clean_token("IMGBB_API_KEY")
 
 # Автопостинг из каналов
 AUTOPOST_ENABLED = os.getenv("AUTOPOST_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
-AUTOPOST_CHANNEL_IDS = [
-    int(cid.strip()) for cid in os.getenv("AUTOPOST_CHANNEL_IDS", "").split(",") if cid.strip().isdigit()
-]
+# Парсим ID каналов (могут быть отрицательными, например -1001423540718)
+_autopost_channels_str = os.getenv("AUTOPOST_CHANNEL_IDS", "").strip()
+AUTOPOST_CHANNEL_IDS = []
+if _autopost_channels_str:
+    for cid in _autopost_channels_str.split(","):
+        cid = cid.strip()
+        try:
+            AUTOPOST_CHANNEL_IDS.append(int(cid))
+        except ValueError:
+            pass  # Пропускаем невалидные значения
 # ID чата для уведомлений об автопостинге (ваш личный чат с ботом или канал для логов)
 AUTOPOST_NOTIFY_CHAT_ID = None
 _notify_chat_id_str = os.getenv("AUTOPOST_NOTIFY_CHAT_ID", "").strip()
