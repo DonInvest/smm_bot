@@ -1044,26 +1044,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик постов из каналов для автопостинга."""
     if not AUTOPOST_ENABLED:
+        print(f"⚠️ Автопостинг отключен (AUTOPOST_ENABLED={AUTOPOST_ENABLED})")
         return
     
     # channel_post может быть в update.channel_post или update.edited_channel_post
     channel_post = update.channel_post or update.edited_channel_post
     if not channel_post:
+        print("⚠️ Нет channel_post в update")
         return
     
     chat_id = channel_post.chat.id
+    print(f"📢 Получен пост из канала {chat_id}")
+    
     # Если указаны конкретные каналы — проверяем
     if AUTOPOST_CHANNEL_IDS and chat_id not in AUTOPOST_CHANNEL_IDS:
+        print(f"⚠️ Канал {chat_id} не в списке разрешенных: {AUTOPOST_CHANNEL_IDS}")
         return
     
     # Игнорируем посты от самого бота (чтобы избежать циклов)
     if channel_post.from_user and channel_post.from_user.is_bot:
+        print(f"⚠️ Игнорируем пост от бота")
         return
     
     user_text, photos = extract_text_and_photos(channel_post)
     if not user_text:
+        print(f"⚠️ Нет текста в посте (только фото без подписи?)")
         return
     
+    print(f"✅ Обрабатываем пост из канала {chat_id}, текст: {user_text[:50]}...")
     photo_file_id = photos[-1].file_id if photos else None
     
     # Автоматически публикуем
