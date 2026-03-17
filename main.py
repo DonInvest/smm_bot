@@ -1148,7 +1148,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(~filters.COMMAND, handle_text))
+    # Важно: channel_post тоже является "message" обновлением.
+    # Если поставить общий MessageHandler без фильтра, он перехватит посты из каналов
+    # и автопостинг не сработает (в группе handler-ов выполняется только первый match).
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGES & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
     
     # Обработчик для постов из каналов (автопостинг)
