@@ -1148,10 +1148,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    # Важно: channel_post тоже является "message" обновлением.
-    # Если поставить общий MessageHandler без фильтра, он перехватит посты из каналов
-    # и автопостинг не сработает (в группе handler-ов выполняется только первый match).
-    app.add_handler(MessageHandler(filters.UpdateType.MESSAGES & ~filters.COMMAND, handle_text))
+    # Важно: посты из каналов должны обрабатываться ТОЛЬКО автопостингом.
+    # Поэтому обычный обработчик текста ограничиваем чат-типами (private/group/supergroup),
+    # чтобы он НИКОГДА не перехватывал channel_post.
+    non_channel_chats = filters.ChatType.PRIVATE | filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
+    app.add_handler(MessageHandler(non_channel_chats & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
     
     # Обработчик для постов из каналов (автопостинг)
