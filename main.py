@@ -312,7 +312,9 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None, reply_to_tweet_i
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
     # Убираем предпросмотр ссылок - добавляем card_uri для отключения карточек
-    if _URL_RE.search(clean):
+    # Важно: X API запрещает передавать одновременно media и card_uri (ошибка 400).
+    # Поэтому card_uri ставим только когда НЕТ медиа.
+    if (not media_ids) and _URL_RE.search(clean):
         payload["card_uri"] = "tombstone://card"
     # Если это ответ в треде - добавляем reply
     if reply_to_tweet_id:
