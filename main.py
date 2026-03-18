@@ -1146,6 +1146,29 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(f"⚠️ Не удалось отправить уведомление: {e}")
 
 
+async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Диагностический handler: логирует любой входящий message/channel_post.
+    Нужен, чтобы понять, доходят ли апдейты из канала до бота.
+    """
+    try:
+        if update.channel_post or update.edited_channel_post:
+            m = update.channel_post or update.edited_channel_post
+            chat_id = getattr(getattr(m, "chat", None), "id", None)
+            kind = "channel_post" if update.channel_post else "edited_channel_post"
+            text = (m.text or m.caption or "").replace("\n", " ")[:80]
+            print(f"🧪 DEBUG update={kind} chat_id={chat_id} text='{text}'")
+        elif update.message or update.edited_message:
+            m = update.message or update.edited_message
+            chat_id = getattr(getattr(m, "chat", None), "id", None)
+            chat_type = getattr(getattr(m, "chat", None), "type", None)
+            kind = "message" if update.message else "edited_message"
+            text = (m.text or m.caption or "").replace("\n", " ")[:80]
+            print(f"🧪 DEBUG update={kind} chat_id={chat_id} chat_type={chat_type} text='{text}'")
+    except Exception as e:
+        print(f"🧪 DEBUG error: {e}")
+
+
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     # Важно: посты из каналов должны обрабатываться ТОЛЬКО автопостингом.
@@ -1154,6 +1177,8 @@ if __name__ == '__main__':
     non_channel_chats = filters.ChatType.PRIVATE | filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
     app.add_handler(MessageHandler(non_channel_chats & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(button_handler))
+    # DEBUG: логируем любые апдейты отдельной группой, не мешает основной логике
+    app.add_handler(MessageHandler(filters.ALL, debug_any_update), group=1)
     
     # Обработчик для постов из каналов (автопостинг)
     if AUTOPOST_ENABLED:
