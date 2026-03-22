@@ -312,6 +312,8 @@ def _build_project_entity_hints(source_text: str) -> str:
     if not PROJECT_ALIAS_HINTS or not source_text:
         return ""
     src = source_text.lower()
+    # Разрешаем тикер только если он уже явно присутствует в исходнике ($ABC)
+    source_tickers = {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}
     lines = []
     for item in PROJECT_ALIAS_HINTS.split(","):
         item = item.strip()
@@ -327,6 +329,10 @@ def _build_project_entity_hints(source_text: str) -> str:
         if key.lower() in src:
             if ticker and not ticker.startswith("$"):
                 ticker = f"${ticker}"
+            # Тикер в подсказку добавляем только если он есть в исходном тексте.
+            # Это защищает от "выдуманных" тикеров вроде $BKP вместо фактического $BP.
+            if ticker and ticker.upper() not in source_tickers:
+                ticker = ""
             lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
     return "\n".join(lines)
 
@@ -970,14 +976,14 @@ VIRAL OPTIMIZATION (focus on views & comments):
 - Make it conversational, engaging, and debate-worthy
 - If the source mentions a project/token, HIGHLIGHT it for X discovery:
   - Use @mention if you know the correct official handle.
-  - Use $TICKER if the ticker is explicitly present in the source OR provided in hints below.
+  - Use $TICKER ONLY if the ticker is explicitly present in the source text.
   - Do NOT invent handles/tickers. If you aren't sure, keep the plain name.
 - HASHTAGS: Add ONLY if they genuinely help discoverability AND don't hurt readability. Skip hashtags if the tweet is already strong without them. If adding, use 1-2 max: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
 - Prioritize engagement hooks over hashtags - a question at the end is worth more than 5 hashtags
 
 OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. Focus on driving comments and views, not hashtag stuffing. No explanations.
 
-PROJECT/TICKER HINTS (use if relevant, do not invent):
+PROJECT/TICKER HINTS (handles from config; ticker only if present in source):
 {entity_hints if entity_hints else "- (none)"}
 
 Original post:
