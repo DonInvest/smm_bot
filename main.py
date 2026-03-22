@@ -267,6 +267,18 @@ def clamp_to_limits(text: str) -> str:
     return t.strip()
 
 
+def x_tweet_url(tweet_id: Optional[str]) -> Optional[str]:
+    if not tweet_id:
+        return None
+    return f"https://x.com/i/web/status/{tweet_id}"
+
+
+def farcaster_cast_url(cast_hash: Optional[str]) -> Optional[str]:
+    if not cast_hash:
+        return None
+    return f"https://warpcast.com/~/conversations/{cast_hash}"
+
+
 def upload_media_to_x(
     photo_path: str,
     api_key: Optional[str] = None,
@@ -1128,7 +1140,36 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             err = result_fc.get("error") or result_fc.get("body") or result_fc
             lines.append(f"❌ Farcaster: {err}")
     
-    result_msg = "\n".join(lines)
+    # Формируем уведомление с ссылками
+    notify_lines = []
+    if is_thread:
+        x_replies = (result.get("x") or {}).get("replies") or []
+        fc_replies = (result.get("farcaster") or {}).get("replies") or []
+        first_x_id = next((r.get("id") for r in x_replies if r.get("ok") and r.get("id")), None)
+        first_fc_hash = next((r.get("hash") for r in fc_replies if r.get("ok") and r.get("hash")), None)
+        x_link = x_tweet_url(first_x_id)
+        fc_link = farcaster_cast_url(first_fc_hash)
+
+        notify_lines.append(f"🧵 Автопост треда из канала {chat_id}")
+        notify_lines.extend(lines)
+        if x_link:
+            notify_lines.append(f"✅ [Опубликовано в X]({x_link})")
+        if fc_link:
+            notify_lines.append(f"✅ [Опубликовано в Farcaster]({fc_link})")
+    else:
+        result_x = result.get("x", {})
+        result_fc = result.get("farcaster", {})
+        x_link = x_tweet_url(result_x.get("id")) if result_x.get("ok") else None
+        fc_link = farcaster_cast_url(result_fc.get("hash")) if result_fc.get("ok") else None
+
+        notify_lines.append(f"📤 Автопост из канала {chat_id}")
+        notify_lines.extend(lines)
+        if x_link:
+            notify_lines.append(f"✅ [Опубликовано в X]({x_link})")
+        if fc_link:
+            notify_lines.append(f"✅ [Опубликовано в Farcaster]({fc_link})")
+
+    result_msg = "\n".join(notify_lines)
     
     # Логируем в консоль
     if result.get("ok"):
@@ -1136,12 +1177,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         print(f"❌ Автопост из канала {chat_id}: ошибка - {result.get('error', result)}")
     
-    # Отправляем уведомление в Telegram, если указан chat_id
-    if AUTOPOST_NOTIFY_CHAT_ID:
+    # Отправляем уведомление в Telegram только после успешного автопостинга
+    if AUTOPOST_NOTIFY_CHAT_ID and result.get("ok"):
         try:
             await context.bot.send_message(
                 chat_id=AUTOPOST_NOTIFY_CHAT_ID,
-                text=f"📤 Автопост из канала:\n\n{result_msg}",
+                text=result_msg,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
                 disable_notification=False,
             )
         except Exception as e:
