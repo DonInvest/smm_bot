@@ -155,6 +155,10 @@ _notify_chat_id_str = os.getenv("AUTOPOST_NOTIFY_CHAT_ID", "").strip()
 if _notify_chat_id_str and _notify_chat_id_str.isdigit():
     AUTOPOST_NOTIFY_CHAT_ID = int(_notify_chat_id_str)
 
+# Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
+# Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
+PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
+
 # Лимиты
 X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
@@ -277,6 +281,33 @@ def farcaster_cast_url(cast_hash: Optional[str]) -> Optional[str]:
     if not cast_hash:
         return None
     return f"https://warpcast.com/~/conversations/{cast_hash}"
+
+
+def _build_project_entity_hints(source_text: str) -> str:
+    """
+    Собирает подсказки для модели по @/$ из PROJECT_ALIAS_HINTS на основе текста поста.
+    Возвращает блок строк для промпта.
+    """
+    if not PROJECT_ALIAS_HINTS or not source_text:
+        return ""
+    src = source_text.lower()
+    lines = []
+    for item in PROJECT_ALIAS_HINTS.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        # key:@handle:$TICKER (ticker опционален)
+        parts = [p.strip() for p in item.split(":") if p.strip()]
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+        ticker = parts[2] if len(parts) > 2 else ""
+        if key.lower() in src:
+            if ticker and not ticker.startswith("$"):
+                ticker = f"${ticker}"
+            lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
+    return "\n".join(lines)
 
 
 def upload_media_to_x(
@@ -804,6 +835,8 @@ async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
     """Переводит текст используя Grok (xAI) - оптимизировано для алгоритма X 2025."""
     if not client_grok:
         return None
+
+    entity_hints = _build_project_entity_hints(text)
     
     prompt = f"""
 You are Grok, an expert at creating viral X (Twitter) content optimized for MAXIMUM VIEWS and COMMENTS in 2025.
@@ -827,11 +860,17 @@ VIRAL OPTIMIZATION (focus on views & comments):
 - END WITH A QUESTION or controversial statement to drive replies (CRITICAL - this is more important than hashtags)
 - Use specific numbers, metrics, concrete examples
 - Make it conversational, engaging, and debate-worthy
-- Add @mentions ONLY for well-known projects if relevant: @ethereum @solana @OpenAI @VitalikButerin
+- If the source mentions a project/token, HIGHLIGHT it for X discovery:
+  - Use @mention if you know the correct official handle.
+  - Use $TICKER if the ticker is explicitly present in the source OR provided in hints below.
+  - Do NOT invent handles/tickers. If you aren't sure, keep the plain name.
 - HASHTAGS: Add ONLY if they genuinely help discoverability AND don't hurt readability. Skip hashtags if the tweet is already strong without them. If adding, use 1-2 max: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
 - Prioritize engagement hooks over hashtags - a question at the end is worth more than 5 hashtags
 
 OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. Focus on driving comments and views, not hashtag stuffing. No explanations.
+
+PROJECT/TICKER HINTS (use if relevant, do not invent):
+{entity_hints if entity_hints else "- (none)"}
 
 Original post:
 {text}
