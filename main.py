@@ -5,6 +5,7 @@ import requests
 import asyncio
 import re
 import tempfile
+import time
 from typing import List, Optional, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler
@@ -40,6 +41,7 @@ X_CLIENT_SECRET = clean_token("X_CLIENT_SECRET")
 
 # Файл с актуальными токенами после refresh (чтобы не терять после перезапуска)
 _X_TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".x_tokens.json")
+_AUTOPOST_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".autopost_state.json")
 # Текущий access token в памяти (обновляется при refresh)
 _x_access_token: Optional[str] = None
 _x_refresh_token: Optional[str] = None
@@ -82,6 +84,24 @@ def _save_x_tokens(access_token: str, refresh_token: Optional[str]) -> None:
                 f,
                 ensure_ascii=False,
             )
+    except Exception:
+        pass
+
+
+def _load_autopost_state() -> dict:
+    if os.path.isfile(_AUTOPOST_STATE_FILE):
+        try:
+            with open(_AUTOPOST_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_autopost_state(state: dict) -> None:
+    try:
+        with open(_AUTOPOST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -163,6 +183,7 @@ PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
 X_MAX_CHARS = 280
 FARCASTER_MAX_BYTES = 320  # Farcaster лимит измеряется в байтах UTF-8
 X_TCO_URL_LEN = 23  # приближение: X считает каждый URL как фиксированную длину
+AUTOPOST_EDIT_WINDOW_SECONDS = 300  # 5 минут: удаляем старые и репостим после редактирования
 
 # Grok (xAI) для X постов - лучше понимает алгоритм X
 # Используем OpenAI-compatible API формат
@@ -450,6 +471,49 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None, reply_to_ha
         if resp.status_code == 200 and data.get("success"):
             cast_hash = (data.get("cast") or {}).get("hash")
             return {"ok": True, "hash": cast_hash, "cast": data.get("cast")}
+        return {"ok": False, "status": resp.status_code, "body": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def delete_x_tweet(tweet_id: str) -> dict:
+    if not tweet_id:
+        return {"ok": False, "error": "Missing tweet_id"}
+    url = f"https://api.x.com/2/tweets/{tweet_id}"
+    try:
+        headers = {"Authorization": f"Bearer {_get_x_access_token()}"}
+        resp = requests.delete(url, headers=headers, timeout=20)
+        data = resp.json() if resp.text else {}
+        if resp.status_code in (200, 204):
+            return {"ok": True}
+        if resp.status_code == 401 and _refresh_x_token():
+            headers = {"Authorization": f"Bearer {_get_x_access_token()}"}
+            resp2 = requests.delete(url, headers=headers, timeout=20)
+            data2 = resp2.json() if resp2.text else {}
+            if resp2.status_code in (200, 204):
+                return {"ok": True}
+            return {"ok": False, "status": resp2.status_code, "body": data2}
+        return {"ok": False, "status": resp.status_code, "body": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def delete_farcaster_cast(cast_hash: str) -> dict:
+    if not cast_hash:
+        return {"ok": False, "error": "Missing cast hash"}
+    if not NEYNAR_API_KEY or not NEYNAR_SIGNER_UUID:
+        return {"ok": False, "error": "Missing NEYNAR_API_KEY or NEYNAR_SIGNER_UUID"}
+    url = "https://api.neynar.com/v2/farcaster/cast/"
+    headers = {
+        "x-api-key": NEYNAR_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "target_hash": cast_hash}
+    try:
+        resp = requests.delete(url, json=payload, headers=headers, timeout=20)
+        data = resp.json() if resp.text else {}
+        if resp.status_code in (200, 204):
+            return {"ok": True}
         return {"ok": False, "status": resp.status_code, "body": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -766,6 +830,50 @@ async def auto_post_to_socials(text: str, photo_file_id: Optional[str] = None, b
     
     # Обычная публикация одного поста
     return await _post_single_section(text, photo_file_id, bot)
+
+
+def _extract_social_ids(result: dict) -> Tuple[List[str], List[str]]:
+    """
+    Из результата автопостинга собирает списки ID X-постов и Farcaster hash.
+    """
+    x_ids: List[str] = []
+    fc_hashes: List[str] = []
+    if not result:
+        return x_ids, fc_hashes
+
+    if result.get("thread"):
+        for r in ((result.get("x") or {}).get("replies") or []):
+            if r.get("ok") and r.get("id"):
+                x_ids.append(str(r.get("id")))
+        for r in ((result.get("farcaster") or {}).get("replies") or []):
+            if r.get("ok") and r.get("hash"):
+                fc_hashes.append(str(r.get("hash")))
+    else:
+        rx = result.get("x") or {}
+        rf = result.get("farcaster") or {}
+        if rx.get("ok") and rx.get("id"):
+            x_ids.append(str(rx.get("id")))
+        if rf.get("ok") and rf.get("hash"):
+            fc_hashes.append(str(rf.get("hash")))
+    return x_ids, fc_hashes
+
+
+def _delete_previous_social_posts(record: dict) -> Tuple[List[str], List[str]]:
+    """
+    Удаляет ранее опубликованные посты/касты по record.
+    Возвращает (errors_x, errors_fc)
+    """
+    errors_x: List[str] = []
+    errors_fc: List[str] = []
+    for tweet_id in record.get("x_ids", []) or []:
+        d = delete_x_tweet(str(tweet_id))
+        if not d.get("ok"):
+            errors_x.append(str(d))
+    for cast_hash in record.get("fc_hashes", []) or []:
+        d = delete_farcaster_cast(str(cast_hash))
+        if not d.get("ok"):
+            errors_fc.append(str(d))
+    return errors_x, errors_fc
 
 
 async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = None, bot=None) -> dict:
@@ -1114,6 +1222,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     chat_id = channel_post.chat.id
+    message_id = channel_post.message_id
+    is_edited = bool(update.edited_channel_post)
     print(f"📢 Получен пост из канала {chat_id}")
     
     # Если указаны конкретные каналы — проверяем
@@ -1133,9 +1243,37 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     print(f"✅ Обрабатываем пост из канала {chat_id}, текст: {user_text[:50]}...")
     photo_file_id = photos[-1].file_id if photos else None
+
+    # Если это редактирование в течение 5 минут — удаляем старые посты и публикуем заново
+    state = _load_autopost_state()
+    state_key = f"{chat_id}:{message_id}"
+    prev_record = state.get(state_key)
+    if is_edited and prev_record:
+        age_sec = int(time.time() - int(prev_record.get("posted_at", 0)))
+        if age_sec <= AUTOPOST_EDIT_WINDOW_SECONDS:
+            print(f"♻️ Редактирование в окне {AUTOPOST_EDIT_WINDOW_SECONDS}s: удаляем старые посты и репостим")
+            err_x, err_fc = _delete_previous_social_posts(prev_record)
+            if err_x:
+                print(f"⚠️ Ошибки удаления X: {err_x}")
+            if err_fc:
+                print(f"⚠️ Ошибки удаления Farcaster: {err_fc}")
+        else:
+            print(f"ℹ️ Редактирование позже окна {AUTOPOST_EDIT_WINDOW_SECONDS}s — удаление пропущено")
     
     # Автоматически публикуем
     result = await auto_post_to_socials(user_text, photo_file_id, context.bot)
+
+    # Сохраняем связь channel message -> social ids для последующего delete/repost
+    if result.get("ok"):
+        x_ids, fc_hashes = _extract_social_ids(result)
+        state[state_key] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "posted_at": int(time.time()),
+            "x_ids": x_ids,
+            "fc_hashes": fc_hashes,
+        }
+        _save_autopost_state(state)
     
     # Формируем сообщение о результате
     is_thread = result.get("thread", False)
