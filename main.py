@@ -951,6 +951,51 @@ async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
         return None
 
     entity_hints = _build_project_entity_hints(text)
+    # Step 1: Extract fact sheet (strictly from source)
+    fact_prompt = f"""
+You are an information extraction system.
+
+TASK: Extract ONLY verifiable facts from the source text (Russian). Do not add, infer, or guess.
+
+Return a compact JSON with keys:
+- "topics": [..] short topic tags
+- "projects": [{"name": "...", "handle": "@...", "ticker": "$...", "evidence": "exact quote"}] (handle from hints if present; ticker ONLY if appears in source)
+- "numbers": [{"value": "...", "context": "...", "evidence": "exact quote"}]
+- "claims": [{"claim": "...", "evidence": "exact quote"}]
+- "author_tone": "angry|sarcastic|neutral|excited|disappointed|warning|etc" (best guess)
+- "call_to_action_seed": "a single short question that would drive replies" (must be consistent with source)
+
+HINTS (may include handles; ticker only if present in source):
+{entity_hints if entity_hints else "- (none)"}
+
+SOURCE:
+{text}
+""".strip()
+
+    def _grok_chat(messages: list, temperature: float) -> Optional[str]:
+        try:
+            url = "https://api.x.ai/v1/chat/completions"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
+            payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            data = resp.json()
+            if resp.status_code == 200 and "choices" in data:
+                return (data["choices"][0]["message"]["content"] or "").strip()
+            print(f"❌ Grok API error: {data}")
+            return None
+        except Exception as e:
+            print(f"Grok API error: {e}")
+            return None
+
+    fact_sheet_raw = _grok_chat(
+        [
+            {"role": "system", "content": "You output only valid JSON. No markdown."},
+            {"role": "user", "content": fact_prompt},
+        ],
+        temperature=0.0,
+    )
+    if not fact_sheet_raw:
+        return None
     
     prompt = f"""
 You are Grok, an expert at creating viral X (Twitter) content optimized for MAXIMUM VIEWS and COMMENTS in 2025.
@@ -986,38 +1031,25 @@ OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. Focus
 PROJECT/TICKER HINTS (handles from config; ticker only if present in source):
 {entity_hints if entity_hints else "- (none)"}
 
+FACT SHEET (ground truth; do not contradict; do not add new facts beyond this):
+{fact_sheet_raw}
+
 Original post:
 {text}
 """.strip()
     
     try:
-        # Используем OpenAI-compatible API формат
-        url = "https://api.x.ai/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {client_grok}",
-        }
-        payload = {
-            "model": GROK_MODEL,
-            "messages": [
+        raw_translated = _grok_chat(
+            [
                 {
                     "role": "system",
-                    "content": "You are Grok, expert at creating viral X (Twitter) content optimized for the 2025 algorithm."
+                    "content": "You write like a human crypto/tech operator on X. Be punchy, specific, provocative (but factual).",
                 },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "user", "content": prompt},
             ],
-            "temperature": 0.7,
-            "stream": False,
-        }
-        
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        data = resp.json()
-        
-        if resp.status_code == 200 and "choices" in data:
-            raw_translated = (data["choices"][0]["message"]["content"] or "").strip()
+            temperature=0.8,
+        )
+        if raw_translated:
             translated = normalize_social_text(raw_translated)
             translated = _avoid_cutting_url(translated)
             
@@ -1030,9 +1062,7 @@ Original post:
             final = clamp_to_limits(translated)
             print(f"✅ Grok: переведено и оптимизировано ({len(final)} chars)")
             return final
-        else:
-            print(f"❌ Grok API error: {data}")
-            return None
+        return None
     except Exception as e:
         print(f"Grok translation error: {e}")
         return None
