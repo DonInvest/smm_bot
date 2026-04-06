@@ -963,9 +963,9 @@ TASK: Extract ONLY verifiable facts from the source text (Russian). Do not add, 
 
 Return a compact JSON with keys:
 - "topics": [..] short topic tags
-- "projects": [{"name": "...", "handle": "@...", "ticker": "$...", "evidence": "exact quote"}] (handle from hints if present; ticker ONLY if appears in source)
-- "numbers": [{"value": "...", "context": "...", "evidence": "exact quote"}]
-- "claims": [{"claim": "...", "evidence": "exact quote"}]
+- "projects": [{{"name": "...", "handle": "@...", "ticker": "$...", "evidence": "exact quote"}}] (handle from hints if present; ticker ONLY if appears in source)
+- "numbers": [{{"value": "...", "context": "...", "evidence": "exact quote"}}]
+- "claims": [{{"claim": "...", "evidence": "exact quote"}}]
 - "author_tone": "angry|sarcastic|neutral|excited|disappointed|warning|etc" (best guess)
 - "call_to_action_seed": "a single short question that would drive replies" (must be consistent with source)
 
