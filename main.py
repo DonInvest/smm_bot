@@ -172,8 +172,12 @@ if _autopost_channels_str:
 # ID чата для уведомлений об автопостинге (ваш личный чат с ботом или канал для логов)
 AUTOPOST_NOTIFY_CHAT_ID = None
 _notify_chat_id_str = os.getenv("AUTOPOST_NOTIFY_CHAT_ID", "").strip()
-if _notify_chat_id_str and _notify_chat_id_str.isdigit():
-    AUTOPOST_NOTIFY_CHAT_ID = int(_notify_chat_id_str)
+if _notify_chat_id_str:
+    try:
+        # Поддерживаем и положительные user_id, и отрицательные channel/group chat_id
+        AUTOPOST_NOTIFY_CHAT_ID = int(_notify_chat_id_str)
+    except ValueError:
+        AUTOPOST_NOTIFY_CHAT_ID = None
 
 # Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
 # Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
@@ -1401,6 +1405,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Отправляем уведомление в Telegram только после успешного автопостинга
     if AUTOPOST_NOTIFY_CHAT_ID and result.get("ok"):
         try:
+            print(f"📨 Пытаюсь отправить уведомление в chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
             await context.bot.send_message(
                 chat_id=AUTOPOST_NOTIFY_CHAT_ID,
                 text=result_msg,
@@ -1409,7 +1414,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 disable_notification=False,
             )
         except Exception as e:
-            print(f"⚠️ Не удалось отправить уведомление: {e}")
+            print(f"⚠️ Не удалось отправить уведомление (Markdown): {e}")
+            # Fallback: отправляем plain text без markdown-разметки
+            try:
+                plain_text = result_msg.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+                await context.bot.send_message(
+                    chat_id=AUTOPOST_NOTIFY_CHAT_ID,
+                    text=plain_text,
+                    disable_web_page_preview=True,
+                    disable_notification=False,
+                )
+                print("✅ Уведомление отправлено в plain text fallback")
+            except Exception as e2:
+                print(f"❌ Не удалось отправить уведомление даже в plain text: {e2}")
 
 
 async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
