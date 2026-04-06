@@ -972,20 +972,26 @@ SOURCE:
 {text}
 """.strip()
 
-    def _grok_chat(messages: list, temperature: float) -> Optional[str]:
-        try:
-            url = "https://api.x.ai/v1/chat/completions"
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
-            payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
-            resp = requests.post(url, json=payload, headers=headers, timeout=30)
-            data = resp.json()
-            if resp.status_code == 200 and "choices" in data:
-                return (data["choices"][0]["message"]["content"] or "").strip()
-            print(f"❌ Grok API error: {data}")
-            return None
-        except Exception as e:
-            print(f"Grok API error: {e}")
-            return None
+    def _grok_chat(messages: list, temperature: float, retries: int = 2) -> Optional[str]:
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                url = "https://api.x.ai/v1/chat/completions"
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
+                payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
+                resp = requests.post(url, json=payload, headers=headers, timeout=30)
+                data = resp.json()
+                if resp.status_code == 200 and "choices" in data:
+                    return (data["choices"][0]["message"]["content"] or "").strip()
+                last_err = f"status={resp.status_code} body={data}"
+                print(f"❌ Grok API error (attempt {attempt+1}/{retries+1}): {last_err}")
+            except Exception as e:
+                last_err = str(e)
+                print(f"Grok API error (attempt {attempt+1}/{retries+1}): {e}")
+            if attempt < retries:
+                time.sleep(1.2 * (attempt + 1))
+        print(f"❌ Grok окончательно не ответил: {last_err}")
+        return None
 
     fact_sheet_raw = _grok_chat(
         [
@@ -995,7 +1001,9 @@ SOURCE:
         temperature=0.0,
     )
     if not fact_sheet_raw:
-        return None
+        # fallback: работаем без fact-sheet, чтобы не терять автопостинг
+        print("⚠️ Fact-sheet шаг Grok не удался, fallback на single-pass rewrite")
+        fact_sheet_raw = "{}"
     
     prompt = f"""
 You are Grok, an expert at creating viral X (Twitter) content optimized for MAXIMUM VIEWS and COMMENTS in 2025.
