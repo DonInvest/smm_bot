@@ -42,6 +42,7 @@ X_CLIENT_SECRET = clean_token("X_CLIENT_SECRET")
 # Файл с актуальными токенами после refresh (чтобы не терять после перезапуска)
 _X_TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".x_tokens.json")
 _AUTOPOST_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".autopost_state.json")
+_COINGECKO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".coingecko_cache.json")
 # Текущий access token в памяти (обновляется при refresh)
 _x_access_token: Optional[str] = None
 _x_refresh_token: Optional[str] = None
@@ -104,6 +105,131 @@ def _save_autopost_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False)
     except Exception:
         pass
+
+
+def _load_coingecko_cache() -> dict:
+    if os.path.isfile(_COINGECKO_CACHE_FILE):
+        try:
+            with open(_COINGECKO_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_coingecko_cache(cache: dict) -> None:
+    try:
+        with open(_COINGECKO_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _extract_candidate_project_terms(source_text: str) -> List[str]:
+    """
+    Небольшой набор кандидатов проектов из текста:
+    - words после $ (tickers)
+    - capitalized words (2+ chars)
+    - известные бренды по паттерну
+    """
+    terms = set()
+    for m in re.finditer(r"\$([A-Za-z0-9_]{2,15})", source_text):
+        terms.add(m.group(1))
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9]{2,20})\b", source_text):
+        terms.add(m.group(1))
+    # Часто встречающиеся web3/crypto названия в lower-case
+    for k in re.findall(r"\b[a-z][a-z0-9]{2,20}\b", source_text.lower()):
+        if k in {"jupiter", "backpack", "edge", "edgex", "katana", "hyperliquid", "lighter", "stepn", "solana", "ethereum"}:
+            terms.add(k)
+    # ограничиваем размер запроса
+    return list(terms)[:12]
+
+
+def _coingecko_resolve_term(term: str, cache: dict) -> Optional[dict]:
+    """
+    Пробует получить twitter handle + ticker для term из CoinGecko.
+    Возвращает {"name","handle","ticker","score"} или None.
+    """
+    if not term:
+        return None
+    key = term.lower().strip()
+    now = int(time.time())
+    cached = cache.get(key)
+    # TTL 24h
+    if cached and now - int(cached.get("ts", 0)) < 86400:
+        return cached.get("value")
+
+    try:
+        # 1) search coin
+        s = requests.get(
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": term},
+            timeout=12,
+        )
+        data = s.json() if s.status_code == 200 else {}
+        coins = data.get("coins") or []
+        if not coins:
+            cache[key] = {"ts": now, "value": None}
+            return None
+
+        top = coins[0]
+        coin_id = top.get("id")
+        symbol = (top.get("symbol") or "").upper()
+        name = top.get("name") or term
+        score = int(top.get("market_cap_rank") or 999999)
+
+        handle = ""
+        if coin_id:
+            c = requests.get(
+                f"https://api.coingecko.com/api/v3/coins/{coin_id}",
+                params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"},
+                timeout=12,
+            )
+            cdata = c.json() if c.status_code == 200 else {}
+            tw = (((cdata.get("links") or {}).get("twitter_screen_name")) or "").strip()
+            if tw:
+                handle = tw if tw.startswith("@") else f"@{tw}"
+
+        # базовый threshold качества: если rank слишком плохой и нет точного совпадения — не берём
+        exact = key in {str(name).lower(), str(symbol).lower(), str(coin_id).lower() if coin_id else ""}
+        if not exact and score > 5000:
+            value = None
+        else:
+            value = {"name": name, "handle": handle, "ticker": f"${symbol}" if symbol else "", "score": score}
+
+        cache[key] = {"ts": now, "value": value}
+        return value
+    except Exception:
+        cache[key] = {"ts": now, "value": None}
+        return None
+
+
+def _coingecko_entity_hints(source_text: str) -> str:
+    """
+    Авто-подсказки @/$ через CoinGecko.
+    """
+    if not COINGECKO_AUTO_RESOLVE or not source_text:
+        return ""
+    cache = _load_coingecko_cache()
+    terms = _extract_candidate_project_terms(source_text)
+    rows = []
+    for t in terms:
+        resolved = _coingecko_resolve_term(t, cache)
+        if not resolved:
+            continue
+        handle = resolved.get("handle") or ""
+        ticker = resolved.get("ticker") or ""
+        name = resolved.get("name") or t
+        # тикер используем только если он уже встречается в исходнике
+        if ticker and ticker.upper() not in {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}:
+            ticker = ""
+        if handle or ticker:
+            rows.append(f"- {name} -> {handle} {ticker}".strip())
+        if len(rows) >= 6:
+            break
+    _save_coingecko_cache(cache)
+    return "\n".join(rows)
 
 
 def _refresh_x_token() -> Optional[str]:
@@ -182,6 +308,7 @@ if _notify_chat_id_str:
 # Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
 # Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
 PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
+COINGECKO_AUTO_RESOLVE = os.getenv("COINGECKO_AUTO_RESOLVE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Лимиты
 X_MAX_CHARS = 280
@@ -313,31 +440,40 @@ def _build_project_entity_hints(source_text: str) -> str:
     Собирает подсказки для модели по @/$ из PROJECT_ALIAS_HINTS на основе текста поста.
     Возвращает блок строк для промпта.
     """
-    if not PROJECT_ALIAS_HINTS or not source_text:
+    if not source_text:
         return ""
     src = source_text.lower()
     # Разрешаем тикер только если он уже явно присутствует в исходнике ($ABC)
     source_tickers = {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}
     lines = []
-    for item in PROJECT_ALIAS_HINTS.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-        # key:@handle:$TICKER (ticker опционален)
-        parts = [p.strip() for p in item.split(":") if p.strip()]
-        if len(parts) < 2:
-            continue
-        key = parts[0]
-        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-        ticker = parts[2] if len(parts) > 2 else ""
-        if key.lower() in src:
-            if ticker and not ticker.startswith("$"):
-                ticker = f"${ticker}"
-            # Тикер в подсказку добавляем только если он есть в исходном тексте.
-            # Это защищает от "выдуманных" тикеров вроде $BKP вместо фактического $BP.
-            if ticker and ticker.upper() not in source_tickers:
-                ticker = ""
-            lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
+    # 1) Сначала ручные hints (имеют приоритет)
+    if PROJECT_ALIAS_HINTS:
+        for item in PROJECT_ALIAS_HINTS.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            # key:@handle:$TICKER (ticker опционален)
+            parts = [p.strip() for p in item.split(":") if p.strip()]
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+            ticker = parts[2] if len(parts) > 2 else ""
+            if key.lower() in src:
+                if ticker and not ticker.startswith("$"):
+                    ticker = f"${ticker}"
+                # Тикер в подсказку добавляем только если он есть в исходном тексте.
+                if ticker and ticker.upper() not in source_tickers:
+                    ticker = ""
+                lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
+
+    # 2) Затем авто-resolve через CoinGecko (если включен)
+    cg_hints = _coingecko_entity_hints(source_text)
+    if cg_hints:
+        for row in cg_hints.splitlines():
+            row = row.strip()
+            if row and row not in lines:
+                lines.append(row)
     return "\n".join(lines)
 
 
@@ -345,27 +481,44 @@ def _extract_hint_handles_and_tags(source_text: str) -> Tuple[List[str], List[st
     """
     Возвращает (handles, hashtags) из PROJECT_ALIAS_HINTS, релевантных исходному тексту.
     """
-    if not PROJECT_ALIAS_HINTS or not source_text:
+    if not source_text:
         return [], []
     src = source_text.lower()
     handles: List[str] = []
     hashtags: List[str] = []
-    for item in PROJECT_ALIAS_HINTS.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
+    # 1) Ручные hints
+    if PROJECT_ALIAS_HINTS:
+        for item in PROJECT_ALIAS_HINTS.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            parts = [p.strip() for p in item.split(":") if p.strip()]
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            if key.lower() not in src:
+                continue
+            handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+            tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', key.title())}"
+            if handle not in handles:
+                handles.append(handle)
+            if tag != "#" and tag not in hashtags:
+                hashtags.append(tag)
+
+    # 2) CoinGecko auto-resolve
+    cg_hints = _coingecko_entity_hints(source_text)
+    for row in cg_hints.splitlines():
+        m = re.match(r"-\s*(.*?)\s*->\s*(@[A-Za-z0-9_]+)?\s*(\$\w+)?", row.strip())
+        if not m:
             continue
-        parts = [p.strip() for p in item.split(":") if p.strip()]
-        if len(parts) < 2:
-            continue
-        key = parts[0]
-        if key.lower() not in src:
-            continue
-        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-        tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', key.title())}"
-        if handle not in handles:
+        name = (m.group(1) or "").strip()
+        handle = (m.group(2) or "").strip()
+        if handle and handle not in handles:
             handles.append(handle)
-        if tag != "#" and tag not in hashtags:
-            hashtags.append(tag)
+        if name:
+            tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', name.title())}"
+            if tag != "#" and tag not in hashtags:
+                hashtags.append(tag)
     return handles, hashtags
 
 
