@@ -341,6 +341,51 @@ def _build_project_entity_hints(source_text: str) -> str:
     return "\n".join(lines)
 
 
+def _extract_hint_handles_and_tags(source_text: str) -> Tuple[List[str], List[str]]:
+    """
+    Возвращает (handles, hashtags) из PROJECT_ALIAS_HINTS, релевантных исходному тексту.
+    """
+    if not PROJECT_ALIAS_HINTS or not source_text:
+        return [], []
+    src = source_text.lower()
+    handles: List[str] = []
+    hashtags: List[str] = []
+    for item in PROJECT_ALIAS_HINTS.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        parts = [p.strip() for p in item.split(":") if p.strip()]
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        if key.lower() not in src:
+            continue
+        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+        tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', key.title())}"
+        if handle not in handles:
+            handles.append(handle)
+        if tag != "#" and tag not in hashtags:
+            hashtags.append(tag)
+    return handles, hashtags
+
+
+def _ensure_discovery_anchor(text: str, source_text: str) -> str:
+    """
+    Гарантирует минимум один discoverability-якорь для X:
+    - предпочитаем @mention из PROJECT_ALIAS_HINTS
+    - иначе добавляем #Project из PROJECT_ALIAS_HINTS
+    Ничего не выдумываем сверх hints/source.
+    """
+    if re.search(r"(^|[\s])[@#][A-Za-z0-9_]+", text):
+        return text
+    handles, hashtags = _extract_hint_handles_and_tags(source_text)
+    anchor = handles[0] if handles else (hashtags[0] if hashtags else "")
+    if not anchor:
+        return text
+    candidate = f"{text.rstrip()} {anchor}".strip()
+    return clamp_to_limits(candidate)
+
+
 def upload_media_to_x(
     photo_path: str,
     api_key: Optional[str] = None,
@@ -1035,6 +1080,7 @@ VIRAL OPTIMIZATION (focus on views & comments):
   - Use @mention if you know the correct official handle.
   - Use $TICKER ONLY if the ticker is explicitly present in the source text.
   - Do NOT invent handles/tickers. If you aren't sure, keep the plain name.
+- REQUIRED: include at least one discoverability anchor in the final tweet (@mention OR #hashtag) when a project is present in source.
 - HASHTAGS: Add ONLY if they genuinely help discoverability AND don't hurt readability. Skip hashtags if the tweet is already strong without them. If adding, use 1-2 max: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
 - Prioritize engagement hooks over hashtags - a question at the end is worth more than 5 hashtags
 
@@ -1162,17 +1208,19 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
         print(f"🤖 Используется Grok для перевода X поста...")
         result = await _translate_with_grok(text, for_x=True)
         if result:
-            return result
+            return _ensure_discovery_anchor(result, text)
         # Fallback на Gemini если Grok не сработал
         print("⚠️ Grok failed, falling back to Gemini")
         if client_ai and MODEL_NAME:
-            return await _translate_with_gemini(text)
+            g = await _translate_with_gemini(text)
+            return _ensure_discovery_anchor(g, text) if g else None
         return None
     
     # Используем Gemini для Farcaster или если Grok недоступен
     if client_ai and MODEL_NAME:
         print(f"🤖 Используется Gemini для перевода...")
-        return await _translate_with_gemini(text)
+        g = await _translate_with_gemini(text)
+        return _ensure_discovery_anchor(g, text) if (for_x and g) else g
     return None
 
 
