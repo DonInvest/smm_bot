@@ -1,0 +1,27 @@
+# Копируй в /etc/systemd/system/ и включи автозапуск:
+#   sudo cp smm_bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable smm_bot
+#   sudo systemctl start smm_bot
+# Логи: sudo journalctl -u smm_bot -f
+
+[Unit]
+Description=SMM Telegram bot (X + Farcaster)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/smm_bot
+ExecStart=/home/YOUR_USER/smm_bot/venv/bin/python3 -u main.py
+Restart=always
+RestartSec=15
+# Не замирать навсегда после серии быстрых крахей (поведение по умолчанию у многих сборок systemd).
+StartLimitIntervalSec=0
+TimeoutStopSec=45
+KillMode=mixed
+Environment=PYTHONUNBUFFERED=1
+# На VPS часто root и путь вроде /root/smm_bot — замени User/WorkingDirectory/ExecStart.
+
+[Install]
+WantedBy=multi-user.target

@@ -3,13 +3,22 @@ import hashlib
 import json
 import os
 import requests
+from requests import exceptions as requests_exceptions
 import asyncio
 import re
 import tempfile
 import time
+import traceback
 from typing import List, Optional, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
@@ -210,6 +219,22 @@ try:
     GROK_REQUEST_TIMEOUT = max(30, int(os.getenv("GROK_REQUEST_TIMEOUT", "90").strip()))
 except ValueError:
     GROK_REQUEST_TIMEOUT = 90
+try:
+    GROK_HTTP_ATTEMPTS = max(1, min(10, int(os.getenv("GROK_HTTP_ATTEMPTS", "4").strip())))
+except ValueError:
+    GROK_HTTP_ATTEMPTS = 4
+try:
+    GROK_CIRCUIT_THRESHOLD = max(2, min(50, int(os.getenv("GROK_CIRCUIT_THRESHOLD", "5").strip())))
+except ValueError:
+    GROK_CIRCUIT_THRESHOLD = 5
+try:
+    GROK_CIRCUIT_SECONDS = max(30, min(3600, int(os.getenv("GROK_CIRCUIT_SECONDS", "120").strip())))
+except ValueError:
+    GROK_CIRCUIT_SECONDS = 120
+
+_grok_open_until: float = 0.0
+_grok_fail_streak: int = 0
+_grok_circuit_log_at: float = 0.0
 
 # Раздельные тексты X / Farcaster (один вызов Grok/Gemini с JSON { "x", "farcaster" })
 _SEPARATE_XF = os.getenv("SEPARATE_X_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -386,26 +411,115 @@ def clamp_to_farcaster_text(text: str) -> str:
     return _avoid_cutting_url(t).strip()
 
 
+def _grok_circuit_is_open() -> bool:
+    return time.monotonic() < _grok_open_until
+
+
+def _grok_log_circuit_block() -> None:
+    global _grok_circuit_log_at
+    now = time.monotonic()
+    if now - _grok_circuit_log_at < 45.0:
+        return
+    _grok_circuit_log_at = now
+    rem = max(0, int(_grok_open_until - now))
+    print(f"⏸️ Grok: пауза ~{rem}s (circuit breaker), далее Gemini если ключ настроен")
+
+
+def _grok_on_http_success() -> None:
+    global _grok_fail_streak
+    _grok_fail_streak = 0
+
+
+def _grok_on_call_failed() -> None:
+    global _grok_fail_streak, _grok_open_until
+    _grok_fail_streak += 1
+    if _grok_fail_streak >= GROK_CIRCUIT_THRESHOLD:
+        _grok_open_until = time.monotonic() + float(GROK_CIRCUIT_SECONDS)
+        print(
+            f"🔌 Grok circuit: пауза {GROK_CIRCUIT_SECONDS}s после {GROK_CIRCUIT_THRESHOLD} полных сбоев подряд"
+        )
+        _grok_fail_streak = 0
+
+
+def _grok_transient_status(code: int) -> bool:
+    return code in (429, 500, 502, 503, 504)
+
+
+def _grok_backoff_sleep(attempt: int, response: Optional[requests.Response]) -> None:
+    wait = min(120.0, (1.6**attempt) + 0.35 * attempt)
+    if response is not None and response.status_code == 429:
+        ra = response.headers.get("Retry-After") or response.headers.get("retry-after")
+        if ra:
+            try:
+                wait = max(wait, float(ra))
+            except ValueError:
+                pass
+    time.sleep(wait)
+
+
 def _grok_request(messages: list, temperature: float, retries: int = 2) -> Optional[str]:
     if not client_grok:
         return None
-    last_err = None
-    for attempt in range(retries + 1):
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
+        return None
+    max_tries = min(10, max(retries + 1, GROK_HTTP_ATTEMPTS))
+    last_err: Optional[str] = None
+    for attempt in range(max_tries):
         try:
             url = "https://api.x.ai/v1/chat/completions"
             headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
             payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
             resp = requests.post(url, json=payload, headers=headers, timeout=GROK_REQUEST_TIMEOUT)
-            data = resp.json()
-            if resp.status_code == 200 and "choices" in data:
-                return (data["choices"][0]["message"]["content"] or "").strip()
-            last_err = f"status={resp.status_code} body={data}"
-            print(f"❌ Grok API error (attempt {attempt+1}/{retries+1}): {last_err}")
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    last_err = f"invalid json: {e}"
+                    print(f"❌ Grok: невалидный JSON (попытка {attempt + 1}/{max_tries})")
+                    _grok_backoff_sleep(attempt, resp)
+                    continue
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if choices:
+                    raw = (choices[0].get("message") or {}).get("content") or ""
+                    content = str(raw).strip()
+                    if content:
+                        _grok_on_http_success()
+                        return content
+                    last_err = "empty content"
+                else:
+                    last_err = f"no choices: {str(data)[:400]!s}"
+                print(f"❌ Grok: нет текста в ответе ({attempt + 1}/{max_tries})")
+                _grok_backoff_sleep(attempt, resp)
+                continue
+            last_err = f"status={resp.status_code}"
+            try:
+                last_err += f" body={resp.json()}"
+            except Exception:
+                last_err += f" text={resp.text[:240]!r}"
+            print(f"❌ Grok API ({attempt + 1}/{max_tries}): {last_err}")
+            if resp.status_code in (400, 401, 403):
+                break
+            if _grok_transient_status(resp.status_code) or resp.status_code >= 500:
+                if attempt < max_tries - 1:
+                    _grok_backoff_sleep(attempt, resp)
+                continue
+            break
+        except requests_exceptions.Timeout as e:
+            last_err = str(e)
+            print(f"⏱️ Grok timeout ({attempt + 1}/{max_tries}): {e}")
+            if attempt < max_tries - 1:
+                _grok_backoff_sleep(attempt, None)
+        except requests_exceptions.RequestException as e:
+            last_err = str(e)
+            print(f"Grok сеть ({attempt + 1}/{max_tries}): {e}")
+            if attempt < max_tries - 1:
+                _grok_backoff_sleep(attempt, None)
         except Exception as e:
             last_err = str(e)
-            print(f"Grok API error (attempt {attempt+1}/{retries+1}): {e}")
-        if attempt < retries:
-            time.sleep(1.2 * (attempt + 1))
+            print(f"Grok ({attempt + 1}/{max_tries}): {e}")
+            break
+    _grok_on_call_failed()
     print(f"❌ Grok окончательно не ответил: {last_err}")
     return None
 
@@ -1165,6 +1279,9 @@ async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
     """Переводит текст используя Grok (xAI) - оптимизировано для алгоритма X 2025."""
     if not client_grok:
         return None
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
+        return None
 
     entity_hints = _build_project_entity_hints(text)
     # Step 1: Extract fact sheet (strictly from source)
@@ -1402,6 +1519,9 @@ def _finalize_dual_texts(source: str, x_raw: str, fc_raw: str) -> Tuple[str, str
 
 def _translate_dual_grok_block(source: str) -> Optional[Tuple[str, str]]:
     if not client_grok:
+        return None
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
         return None
     hints = _build_project_entity_hints(source)
     hint_block = f"PROJECT HINTS (ticker only if in source):\n{hints}\n" if hints else ""
@@ -1840,6 +1960,20 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"❌ Не удалось отправить уведомление даже в plain text: {e2}")
 
 
+async def _ptb_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит необработанные исключения в хендлерах: лог + не даём PTB уронить процесс без следа."""
+    err = context.error
+    if err is None:
+        return
+    try:
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    except Exception:
+        tb = ""
+    print(f"❌ PTB error: {err!s}")
+    if tb:
+        print(tb)
+
+
 async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Диагностический handler: логирует любой входящий message/channel_post.
@@ -1863,8 +1997,31 @@ async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"🧪 DEBUG error: {e}")
 
 
+async def _bot_post_init(application: Application) -> None:
+    """Опционально пишет timestamp в файл для внешнего watchdog (раз в 60s)."""
+    path = os.getenv("BOT_HEALTH_FILE", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as hf:
+            hf.write(f"{time.time():.3f}\n")
+    except OSError as e:
+        print(f"⚠️ BOT_HEALTH_FILE {path!r}: {e}")
+
+    async def _heartbeat_loop():
+        while True:
+            try:
+                with open(path, "w", encoding="utf-8") as hf:
+                    hf.write(f"{time.time():.3f}\n")
+            except OSError as e:
+                print(f"⚠️ BOT_HEALTH_FILE {path!r}: {e}")
+            await asyncio.sleep(60)
+
+    asyncio.create_task(_heartbeat_loop())
+
+
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_bot_post_init).build()
     # Важно: посты из каналов должны обрабатываться ТОЛЬКО автопостингом.
     # Поэтому обычный обработчик текста ограничиваем чат-типами (private/group/supergroup),
     # чтобы он НИКОГДА не перехватывал channel_post.
@@ -1900,6 +2057,12 @@ if __name__ == '__main__':
     )
     if USE_GROK_FOR_X and client_grok:
         print(f"⏱️ Grok HTTP timeout: {GROK_REQUEST_TIMEOUT}s")
+        print(
+            f"🛡️ Grok: до {GROK_HTTP_ATTEMPTS} HTTP-попыток; circuit: {GROK_CIRCUIT_THRESHOLD} сбоев подряд → пауза {GROK_CIRCUIT_SECONDS}s"
+        )
+    _bot_health = os.getenv("BOT_HEALTH_FILE", "").strip()
+    if _bot_health:
+        print(f"💓 BOT_HEALTH_FILE={_bot_health}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
     print(f"🤖 Автопостинг из каналов: {autopost_status}")
@@ -1907,4 +2070,9 @@ if __name__ == '__main__':
         print(
             f"🧵 Автотред: порог {AUTOPOST_THREAD_MIN_BYTES} байт и список; дедуп контента: {AUTOPOST_DEDUPE_HOURS}h"
         )
-    app.run_polling()
+    app.add_error_handler(_ptb_error_handler)
+    # bootstrap_retries=-1: бесконечные попытки подключиться к Telegram при старте (сеть / DNS).
+    try:
+        app.run_polling(bootstrap_retries=-1)
+    except TypeError:
+        app.run_polling()
