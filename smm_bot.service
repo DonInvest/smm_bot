@@ -3,7 +3,10 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable smm_bot
 #   sudo systemctl start smm_bot
-# Логи: sudo journalctl -u smm_bot -f
+# Логи: journalctl -u smm_bot -n 80 --no-pager
+#
+# Не копируй как есть с User=YOUR_USER — сервис упадёт. Ниже вариант для VPS от root.
+# У root домашний каталог это /root, не /home/root.
 
 [Unit]
 Description=SMM Telegram bot (X + Farcaster)
@@ -11,17 +14,20 @@ After=network.target
 
 [Service]
 Type=simple
-User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/smm_bot
-ExecStart=/home/YOUR_USER/smm_bot/venv/bin/python3 -u main.py
+User=root
+WorkingDirectory=/root/smm_bot
+ExecStart=/root/smm_bot/venv/bin/python3 -u main.py
 Restart=always
 RestartSec=15
-# Не замирать навсегда после серии быстрых крахей (поведение по умолчанию у многих сборок systemd).
 StartLimitIntervalSec=0
 TimeoutStopSec=45
 KillMode=mixed
 Environment=PYTHONUNBUFFERED=1
-# На VPS часто root и путь вроде /root/smm_bot — замени User/WorkingDirectory/ExecStart.
+
+# Если бот не в /root/smm_bot или не root — поправь три строки выше, например:
+# User=ubuntu
+# WorkingDirectory=/home/ubuntu/smm_bot
+# ExecStart=/home/ubuntu/smm_bot/venv/bin/python3 -u main.py
 
 [Install]
 WantedBy=multi-user.target

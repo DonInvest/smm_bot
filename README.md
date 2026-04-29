@@ -32,7 +32,13 @@ A Telegram bot that translates your posts to English and publishes them to **X (
    - `GEMINI_API_KEY` — [Google AI Studio](https://ai.google.dev)
    - `TELEGRAM_BOT_TOKEN` — [@BotFather](https://t.me/BotFather)
    - **X**: run `python auth_x.py` once to get `X_USER_ACCESS_TOKEN` and `X_REFRESH_TOKEN`; add `X_CLIENT_ID`, `X_CLIENT_SECRET` (from [X Developer Portal](https://developer.x.com)).
+   - **X images** (optional): `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET` (OAuth1.0a from X Developer Portal).
    - **Farcaster**: `NEYNAR_API_KEY`, `NEYNAR_SIGNER_UUID` (create signer via `python auth_farcaster.py` and approve in Warpcast).
+   - **Farcaster images** (optional): `IMGBB_API_KEY` — get free API key at [imgbb.com](https://api.imgbb.com) (no registration required, just get the key).
+<<<<<<< Current (Your changes)
+=======
+   - **Auto-posting** (optional): `AUTOPOST_ENABLED=1` to enable, `AUTOPOST_CHANNEL_IDS=-1001234567890` (channel IDs separated by commas, leave empty for all channels). To get channel ID: add [@userinfobot](https://t.me/userinfobot) to your channel.
+>>>>>>> Incoming (Background Agent changes)
 
 3. **Run**
    ```bash
@@ -41,6 +47,19 @@ A Telegram bot that translates your posts to English and publishes them to **X (
 
 See inline comments in `main.py`, `auth_x.py`, and `auth_farcaster.py` for details.
 
+## Auto-posting from Channels
+
+To enable automatic posting from Telegram channels:
+
+1. Add the bot to your channel as an administrator
+2. Set `AUTOPOST_ENABLED=1` in `.env`
+3. (Optional) Set `AUTOPOST_CHANNEL_IDS=-1001234567890` with specific channel IDs (comma-separated). Leave empty to post from all channels where the bot is added.
+4. Restart the bot
+
+Now every post in the channel will be automatically translated and posted to X + Farcaster without any buttons or manual interaction.
+
+**To get channel ID**: Add [@userinfobot](https://t.me/userinfobot) to your channel - it will show the channel ID.
+
 ## Project structure
 
 ```
@@ -48,10 +67,23 @@ smm_bot/
 ├── main.py              # Bot logic, translation, X + Farcaster posting
 ├── auth_x.py            # One-time OAuth2 PKCE flow for X tokens
 ├── auth_farcaster.py    # Create Neynar signer for Farcaster
+├── push_updates.sh      # One-command commit & push to GitHub
 ├── requirements.txt
 ├── .env                 # Your keys (not committed)
 └── README.md
 ```
+
+## Keeping the repo active
+
+After you change code locally, push to GitHub in one step:
+
+```bash
+chmod +x push_updates.sh   # once
+./push_updates.sh          # commits all changes and pushes
+```
+
+Optional: pass a custom message: `./push_updates.sh "Add feature X"`.  
+`.env` and `.x_tokens.json` are ignored and never committed.
 
 ## License
 

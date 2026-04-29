@@ -121,6 +121,23 @@ journalctl -u smm_bot -f
 
 ---
 
+## Как обновлять бота после правок в коде
+
+Обновления на сервер **не попадают сами** — нужно вручную подтянуть код и перезапустить.
+
+1. **На Mac:** закоммить изменения и отправить в GitHub (`git add ... && git commit -m "..." && git push` или скрипт `./push_updates.sh`).
+2. **На сервере:** зайти по SSH и выполнить:
+   ```bash
+   cd /root/smm_bot
+   git pull
+   systemctl restart smm_bot
+   ```
+   Если добавлялись новые зависимости — перед перезапуском: `source venv/bin/activate && pip install -r requirements.txt`.
+
+Когда буду предлагать доработки кода, в конце могу напоминать: «После push на сервере: `cd /root/smm_bot && git pull && systemctl restart smm_bot`».
+
+---
+
 Готово. Бот работает 24/7, Mac можно выключать.
 
 ---
