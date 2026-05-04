@@ -1,6 +1,13 @@
 .env
+.env.save
+.env.*.save
+!.env.example
 .x_tokens.json
+.autopost_state.json
+.coingecko_cache.json
 __pycache__/
 *.pyc
 .venv/
 venv/
+# случайные файлы из копипаста команд в каталог репо
+*--no-pager*
