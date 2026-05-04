@@ -1,14 +1,24 @@
 import base64
+import hashlib
 import json
 import os
 import requests
+from requests import exceptions as requests_exceptions
 import asyncio
 import re
 import tempfile
 import time
+import traceback
 from typing import List, Optional, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
@@ -42,7 +52,6 @@ X_CLIENT_SECRET = clean_token("X_CLIENT_SECRET")
 # Файл с актуальными токенами после refresh (чтобы не терять после перезапуска)
 _X_TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".x_tokens.json")
 _AUTOPOST_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".autopost_state.json")
-_COINGECKO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".coingecko_cache.json")
 # Текущий access token в памяти (обновляется при refresh)
 _x_access_token: Optional[str] = None
 _x_refresh_token: Optional[str] = None
@@ -105,131 +114,6 @@ def _save_autopost_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False)
     except Exception:
         pass
-
-
-def _load_coingecko_cache() -> dict:
-    if os.path.isfile(_COINGECKO_CACHE_FILE):
-        try:
-            with open(_COINGECKO_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _save_coingecko_cache(cache: dict) -> None:
-    try:
-        with open(_COINGECKO_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def _extract_candidate_project_terms(source_text: str) -> List[str]:
-    """
-    Небольшой набор кандидатов проектов из текста:
-    - words после $ (tickers)
-    - capitalized words (2+ chars)
-    - известные бренды по паттерну
-    """
-    terms = set()
-    for m in re.finditer(r"\$([A-Za-z0-9_]{2,15})", source_text):
-        terms.add(m.group(1))
-    for m in re.finditer(r"\b([A-Z][A-Za-z0-9]{2,20})\b", source_text):
-        terms.add(m.group(1))
-    # Часто встречающиеся web3/crypto названия в lower-case
-    for k in re.findall(r"\b[a-z][a-z0-9]{2,20}\b", source_text.lower()):
-        if k in {"jupiter", "backpack", "edge", "edgex", "katana", "hyperliquid", "lighter", "stepn", "solana", "ethereum"}:
-            terms.add(k)
-    # ограничиваем размер запроса
-    return list(terms)[:12]
-
-
-def _coingecko_resolve_term(term: str, cache: dict) -> Optional[dict]:
-    """
-    Пробует получить twitter handle + ticker для term из CoinGecko.
-    Возвращает {"name","handle","ticker","score"} или None.
-    """
-    if not term:
-        return None
-    key = term.lower().strip()
-    now = int(time.time())
-    cached = cache.get(key)
-    # TTL 24h
-    if cached and now - int(cached.get("ts", 0)) < 86400:
-        return cached.get("value")
-
-    try:
-        # 1) search coin
-        s = requests.get(
-            "https://api.coingecko.com/api/v3/search",
-            params={"query": term},
-            timeout=12,
-        )
-        data = s.json() if s.status_code == 200 else {}
-        coins = data.get("coins") or []
-        if not coins:
-            cache[key] = {"ts": now, "value": None}
-            return None
-
-        top = coins[0]
-        coin_id = top.get("id")
-        symbol = (top.get("symbol") or "").upper()
-        name = top.get("name") or term
-        score = int(top.get("market_cap_rank") or 999999)
-
-        handle = ""
-        if coin_id:
-            c = requests.get(
-                f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-                params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"},
-                timeout=12,
-            )
-            cdata = c.json() if c.status_code == 200 else {}
-            tw = (((cdata.get("links") or {}).get("twitter_screen_name")) or "").strip()
-            if tw:
-                handle = tw if tw.startswith("@") else f"@{tw}"
-
-        # базовый threshold качества: если rank слишком плохой и нет точного совпадения — не берём
-        exact = key in {str(name).lower(), str(symbol).lower(), str(coin_id).lower() if coin_id else ""}
-        if not exact and score > 5000:
-            value = None
-        else:
-            value = {"name": name, "handle": handle, "ticker": f"${symbol}" if symbol else "", "score": score}
-
-        cache[key] = {"ts": now, "value": value}
-        return value
-    except Exception:
-        cache[key] = {"ts": now, "value": None}
-        return None
-
-
-def _coingecko_entity_hints(source_text: str) -> str:
-    """
-    Авто-подсказки @/$ через CoinGecko.
-    """
-    if not COINGECKO_AUTO_RESOLVE or not source_text:
-        return ""
-    cache = _load_coingecko_cache()
-    terms = _extract_candidate_project_terms(source_text)
-    rows = []
-    for t in terms:
-        resolved = _coingecko_resolve_term(t, cache)
-        if not resolved:
-            continue
-        handle = resolved.get("handle") or ""
-        ticker = resolved.get("ticker") or ""
-        name = resolved.get("name") or t
-        # тикер используем только если он уже встречается в исходнике
-        if ticker and ticker.upper() not in {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}:
-            ticker = ""
-        if handle or ticker:
-            rows.append(f"- {name} -> {handle} {ticker}".strip())
-        if len(rows) >= 6:
-            break
-    _save_coingecko_cache(cache)
-    return "\n".join(rows)
 
 
 def _refresh_x_token() -> Optional[str]:
@@ -305,10 +189,77 @@ if _notify_chat_id_str:
     except ValueError:
         AUTOPOST_NOTIFY_CHAT_ID = None
 
+# Частая ошибка: в AUTOPOST_NOTIFY_CHAT_ID кладут число до ":" из TELEGRAM_BOT_TOKEN (id бота).
+# Telegram не даёт боту писать боту → Forbidden, уведомления «пропадают».
+_tg_bot_uid: Optional[int] = None
+if TELEGRAM_TOKEN and ":" in TELEGRAM_TOKEN:
+    try:
+        _tg_bot_uid = int(TELEGRAM_TOKEN.split(":", 1)[0])
+    except ValueError:
+        _tg_bot_uid = None
+if (
+    AUTOPOST_NOTIFY_CHAT_ID is not None
+    and _tg_bot_uid is not None
+    and AUTOPOST_NOTIFY_CHAT_ID == _tg_bot_uid
+):
+    print(
+        "⚠️ AUTOPOST_NOTIFY_CHAT_ID совпадает с id бота из токена: уведомления отключены. "
+        "Укажи свой user id (личка с ботом: /start → в логах DEBUG ... chat_id=...)."
+    )
+    AUTOPOST_NOTIFY_CHAT_ID = None
+
 # Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
 # Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
 PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
-COINGECKO_AUTO_RESOLVE = os.getenv("COINGECKO_AUTO_RESOLVE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# X: 1 = перевод/тон автора, без «вирусных» вопросов; 0 = старый режим
+_X_FAITHFUL = os.getenv("X_FAITHFUL_X", "1").strip().lower() in ("1", "true", "yes", "on")
+# 1 = скрыть предпросмотр ссылок (tombstone); 0 = обычные ссылки
+_X_SUPPRESS_LINK_PREVIEWS = os.getenv("X_SUPPRESS_LINK_PREVIEWS", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Автотред из канала только если длиннее N байт (снижает ложные треды)
+_autopost_thread_min = os.getenv("AUTOPOST_THREAD_MIN_BYTES", "2000").strip()
+try:
+    AUTOPOST_THREAD_MIN_BYTES = max(500, int(_autopost_thread_min))
+except ValueError:
+    AUTOPOST_THREAD_MIN_BYTES = 2000
+# Не публиковать тот же текст повторно в течение N часов
+_autopost_dedupe_h = os.getenv("AUTOPOST_DEDUPE_HOURS", "0").strip()
+try:
+    AUTOPOST_DEDUPE_HOURS = max(0, int(_autopost_dedupe_h))
+except ValueError:
+    AUTOPOST_DEDUPE_HOURS = 0
+# Таймаут HTTP к api.x.ai (сек), Grok иногда отвечает дольше 30s
+try:
+    GROK_REQUEST_TIMEOUT = max(30, int(os.getenv("GROK_REQUEST_TIMEOUT", "90").strip()))
+except ValueError:
+    GROK_REQUEST_TIMEOUT = 90
+try:
+    GROK_HTTP_ATTEMPTS = max(1, min(10, int(os.getenv("GROK_HTTP_ATTEMPTS", "4").strip())))
+except ValueError:
+    GROK_HTTP_ATTEMPTS = 4
+try:
+    GROK_CIRCUIT_THRESHOLD = max(2, min(50, int(os.getenv("GROK_CIRCUIT_THRESHOLD", "5").strip())))
+except ValueError:
+    GROK_CIRCUIT_THRESHOLD = 5
+try:
+    GROK_CIRCUIT_SECONDS = max(30, min(3600, int(os.getenv("GROK_CIRCUIT_SECONDS", "120").strip())))
+except ValueError:
+    GROK_CIRCUIT_SECONDS = 120
+
+_grok_open_until: float = 0.0
+_grok_fail_streak: int = 0
+_grok_circuit_log_at: float = 0.0
+
+# Раздельные тексты X / Farcaster (один вызов Grok/Gemini с JSON { "x", "farcaster" })
+_SEPARATE_XF = os.getenv("SEPARATE_X_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
+# Автопост из канала: куда публиковать (и сверху можно сузить #no_x / #no_fc / #only_tg)
+_AUTOP_X = os.getenv("AUTOPOST_X", "1").strip().lower() in ("1", "true", "yes", "on")
+_AUTOP_FC = os.getenv("AUTOPOST_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Лимиты
 X_MAX_CHARS = 280
@@ -353,6 +304,38 @@ def normalize_social_text(text: str) -> str:
 
 
 _URL_RE = re.compile(r"https?://\S+")
+
+
+def extract_http_urls(text: str) -> List[str]:
+    """Все http(s) из текста, по порядку, без дубликатов."""
+    if not text:
+        return []
+    out: List[str] = []
+    seen = set()
+    for m in _URL_RE.finditer(text):
+        u = m.group(0).rstrip(").,;]\"'")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def ensure_urls_preserved(source_text: str, translated: str) -> str:
+    """
+    Если модель выкинула URL из исходника — дописываем в конец, затем подгоняем лимиты.
+    """
+    urls = extract_http_urls(source_text)
+    if not urls:
+        return (translated or "").strip()
+    t = (translated or "").strip()
+    for u in urls:
+        if u in t:
+            continue
+        t = f"{t} {u}".strip() if t else u
+    t = normalize_social_text(t)
+    if fits_limits(t) and len(t.encode("utf-8")) <= FARCASTER_MAX_BYTES:
+        return t
+    return clamp_to_limits(t)
 
 
 def x_effective_length(text: str) -> int:
@@ -423,6 +406,181 @@ def clamp_to_limits(text: str) -> str:
     return t.strip()
 
 
+def fits_x_effective(text: str) -> bool:
+    return x_effective_length(text or "") <= X_MAX_CHARS
+
+
+def clamp_to_x_text(text: str) -> str:
+    """Только лимит X (t.co), без ужатия по байтам Farcaster."""
+    t = normalize_social_text(text)
+    while not fits_x_effective(t) and t:
+        t = t[:-1]
+    return _avoid_cutting_url(t).strip()
+
+
+def fits_farcaster_text(text: str) -> bool:
+    return len((text or "").encode("utf-8")) <= FARCASTER_MAX_BYTES
+
+
+def clamp_to_farcaster_text(text: str) -> str:
+    """Только лимит байт Farcaster."""
+    t = normalize_social_text(text)
+    while not fits_farcaster_text(t) and t:
+        t = t[:-1]
+    return _avoid_cutting_url(t).strip()
+
+
+def _grok_circuit_is_open() -> bool:
+    return time.monotonic() < _grok_open_until
+
+
+def _grok_log_circuit_block() -> None:
+    global _grok_circuit_log_at
+    now = time.monotonic()
+    if now - _grok_circuit_log_at < 45.0:
+        return
+    _grok_circuit_log_at = now
+    rem = max(0, int(_grok_open_until - now))
+    print(f"⏸️ Grok: пауза ~{rem}s (circuit breaker), далее Gemini если ключ настроен")
+
+
+def _grok_on_http_success() -> None:
+    global _grok_fail_streak
+    _grok_fail_streak = 0
+
+
+def _grok_on_call_failed() -> None:
+    global _grok_fail_streak, _grok_open_until
+    _grok_fail_streak += 1
+    if _grok_fail_streak >= GROK_CIRCUIT_THRESHOLD:
+        _grok_open_until = time.monotonic() + float(GROK_CIRCUIT_SECONDS)
+        print(
+            f"🔌 Grok circuit: пауза {GROK_CIRCUIT_SECONDS}s после {GROK_CIRCUIT_THRESHOLD} полных сбоев подряд"
+        )
+        _grok_fail_streak = 0
+
+
+def _grok_transient_status(code: int) -> bool:
+    return code in (429, 500, 502, 503, 504)
+
+
+def _grok_backoff_sleep(attempt: int, response: Optional[requests.Response]) -> None:
+    wait = min(120.0, (1.6**attempt) + 0.35 * attempt)
+    if response is not None and response.status_code == 429:
+        ra = response.headers.get("Retry-After") or response.headers.get("retry-after")
+        if ra:
+            try:
+                wait = max(wait, float(ra))
+            except ValueError:
+                pass
+    time.sleep(wait)
+
+
+def _grok_request(messages: list, temperature: float, retries: int = 2) -> Optional[str]:
+    if not client_grok:
+        return None
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
+        return None
+    max_tries = min(10, max(retries + 1, GROK_HTTP_ATTEMPTS))
+    last_err: Optional[str] = None
+    for attempt in range(max_tries):
+        try:
+            url = "https://api.x.ai/v1/chat/completions"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
+            payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
+            resp = requests.post(url, json=payload, headers=headers, timeout=GROK_REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    last_err = f"invalid json: {e}"
+                    print(f"❌ Grok: невалидный JSON (попытка {attempt + 1}/{max_tries})")
+                    _grok_backoff_sleep(attempt, resp)
+                    continue
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if choices:
+                    raw = (choices[0].get("message") or {}).get("content") or ""
+                    content = str(raw).strip()
+                    if content:
+                        _grok_on_http_success()
+                        return content
+                    last_err = "empty content"
+                else:
+                    last_err = f"no choices: {str(data)[:400]!s}"
+                print(f"❌ Grok: нет текста в ответе ({attempt + 1}/{max_tries})")
+                _grok_backoff_sleep(attempt, resp)
+                continue
+            last_err = f"status={resp.status_code}"
+            try:
+                last_err += f" body={resp.json()}"
+            except Exception:
+                last_err += f" text={resp.text[:240]!r}"
+            print(f"❌ Grok API ({attempt + 1}/{max_tries}): {last_err}")
+            if resp.status_code in (400, 401, 403):
+                break
+            if _grok_transient_status(resp.status_code) or resp.status_code >= 500:
+                if attempt < max_tries - 1:
+                    _grok_backoff_sleep(attempt, resp)
+                continue
+            break
+        except requests_exceptions.Timeout as e:
+            last_err = str(e)
+            print(f"⏱️ Grok timeout ({attempt + 1}/{max_tries}): {e}")
+            if attempt < max_tries - 1:
+                _grok_backoff_sleep(attempt, None)
+        except requests_exceptions.RequestException as e:
+            last_err = str(e)
+            print(f"Grok сеть ({attempt + 1}/{max_tries}): {e}")
+            if attempt < max_tries - 1:
+                _grok_backoff_sleep(attempt, None)
+        except Exception as e:
+            last_err = str(e)
+            print(f"Grok ({attempt + 1}/{max_tries}): {e}")
+            break
+    _grok_on_call_failed()
+    print(f"❌ Grok окончательно не ответил: {last_err}")
+    return None
+
+
+def parse_channel_post_directives(
+    text: str,
+) -> Tuple[str, bool, bool, bool]:
+    """
+    Убирает ведущие директивы с первых строк. Возвращает:
+    (тело, want_x, want_fc, only_tg)
+    #only_tg — никуда вне TG; #no_x / #no_fc / #not_x / #not_fc — снять X или FC
+    """
+    if not (text and text.strip()):
+        return (text, True, True, False)
+    lines = text.split("\n")
+    i = 0
+    no_x, no_fc, only_tg = False, False, False
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        if not s.startswith("#"):
+            break
+        tag = s.split()[0].lstrip("#").lower()
+        if tag in ("only_tg", "tg_only", "только_tg"):
+            only_tg = True
+        elif tag in ("no_x", "not_x", "no_twitter", "notwitter", "fconly", "farcaster_only", "fc_only", "только_фк", "только_farcaster"):
+            no_x = True
+        elif tag in ("xonly", "x_only", "только_x", "только_твиттер"):
+            no_fc = True
+        elif tag in ("no_fc", "not_fc", "no_farcaster", "no_cast", "nohcast"):
+            no_fc = True
+        else:
+            break
+        i += 1
+    rest = "\n".join(lines[i:]).lstrip()
+    if only_tg:
+        return (rest, False, False, True)
+    return (rest, not no_x, not no_fc, False)
+
+
 def x_tweet_url(tweet_id: Optional[str]) -> Optional[str]:
     if not tweet_id:
         return None
@@ -440,103 +598,32 @@ def _build_project_entity_hints(source_text: str) -> str:
     Собирает подсказки для модели по @/$ из PROJECT_ALIAS_HINTS на основе текста поста.
     Возвращает блок строк для промпта.
     """
-    if not source_text:
+    if not PROJECT_ALIAS_HINTS or not source_text:
         return ""
     src = source_text.lower()
     # Разрешаем тикер только если он уже явно присутствует в исходнике ($ABC)
     source_tickers = {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}
     lines = []
-    # 1) Сначала ручные hints (имеют приоритет)
-    if PROJECT_ALIAS_HINTS:
-        for item in PROJECT_ALIAS_HINTS.split(","):
-            item = item.strip()
-            if not item or ":" not in item:
-                continue
-            # key:@handle:$TICKER (ticker опционален)
-            parts = [p.strip() for p in item.split(":") if p.strip()]
-            if len(parts) < 2:
-                continue
-            key = parts[0]
-            handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-            ticker = parts[2] if len(parts) > 2 else ""
-            if key.lower() in src:
-                if ticker and not ticker.startswith("$"):
-                    ticker = f"${ticker}"
-                # Тикер в подсказку добавляем только если он есть в исходном тексте.
-                if ticker and ticker.upper() not in source_tickers:
-                    ticker = ""
-                lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
-
-    # 2) Затем авто-resolve через CoinGecko (если включен)
-    cg_hints = _coingecko_entity_hints(source_text)
-    if cg_hints:
-        for row in cg_hints.splitlines():
-            row = row.strip()
-            if row and row not in lines:
-                lines.append(row)
-    return "\n".join(lines)
-
-
-def _extract_hint_handles_and_tags(source_text: str) -> Tuple[List[str], List[str]]:
-    """
-    Возвращает (handles, hashtags) из PROJECT_ALIAS_HINTS, релевантных исходному тексту.
-    """
-    if not source_text:
-        return [], []
-    src = source_text.lower()
-    handles: List[str] = []
-    hashtags: List[str] = []
-    # 1) Ручные hints
-    if PROJECT_ALIAS_HINTS:
-        for item in PROJECT_ALIAS_HINTS.split(","):
-            item = item.strip()
-            if not item or ":" not in item:
-                continue
-            parts = [p.strip() for p in item.split(":") if p.strip()]
-            if len(parts) < 2:
-                continue
-            key = parts[0]
-            if key.lower() not in src:
-                continue
-            handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-            tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', key.title())}"
-            if handle not in handles:
-                handles.append(handle)
-            if tag != "#" and tag not in hashtags:
-                hashtags.append(tag)
-
-    # 2) CoinGecko auto-resolve
-    cg_hints = _coingecko_entity_hints(source_text)
-    for row in cg_hints.splitlines():
-        m = re.match(r"-\s*(.*?)\s*->\s*(@[A-Za-z0-9_]+)?\s*(\$\w+)?", row.strip())
-        if not m:
+    for item in PROJECT_ALIAS_HINTS.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
             continue
-        name = (m.group(1) or "").strip()
-        handle = (m.group(2) or "").strip()
-        if handle and handle not in handles:
-            handles.append(handle)
-        if name:
-            tag = f"#{re.sub(r'[^A-Za-z0-9_]', '', name.title())}"
-            if tag != "#" and tag not in hashtags:
-                hashtags.append(tag)
-    return handles, hashtags
-
-
-def _ensure_discovery_anchor(text: str, source_text: str) -> str:
-    """
-    Гарантирует минимум один discoverability-якорь для X:
-    - предпочитаем @mention из PROJECT_ALIAS_HINTS
-    - иначе добавляем #Project из PROJECT_ALIAS_HINTS
-    Ничего не выдумываем сверх hints/source.
-    """
-    if re.search(r"(^|[\s])[@#][A-Za-z0-9_]+", text):
-        return text
-    handles, hashtags = _extract_hint_handles_and_tags(source_text)
-    anchor = handles[0] if handles else (hashtags[0] if hashtags else "")
-    if not anchor:
-        return text
-    candidate = f"{text.rstrip()} {anchor}".strip()
-    return clamp_to_limits(candidate)
+        # key:@handle:$TICKER (ticker опционален)
+        parts = [p.strip() for p in item.split(":") if p.strip()]
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+        ticker = parts[2] if len(parts) > 2 else ""
+        if key.lower() in src:
+            if ticker and not ticker.startswith("$"):
+                ticker = f"${ticker}"
+            # Тикер в подсказку добавляем только если он есть в исходном тексте.
+            # Это защищает от "выдуманных" тикеров вроде $BKP вместо фактического $BP.
+            if ticker and ticker.upper() not in source_tickers:
+                ticker = ""
+            lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
+    return "\n".join(lines)
 
 
 def upload_media_to_x(
@@ -575,18 +662,18 @@ def post_to_x(text: str, media_ids: Optional[List[str]] = None, reply_to_tweet_i
     Публикуем пост в X API v2.
     Всегда используем OAuth2 (Bearer) для твита — так не будет 401 при истёкших OAuth1.
     Фото загружаются отдельно через upload_media_to_x (OAuth1), сюда передаются уже media_ids.
-    card_uri: "tombstone://card" убирает предпросмотр ссылок (link preview cards).
+    card_uri: "tombstone://card" опционально (X_SUPPRESS_LINK_PREVIEWS=1) отключает предпросмотр ссылок.
     reply_to_tweet_id: ID твита для ответа (создание треда).
     """
     url = "https://api.x.com/2/tweets"
-    clean = clamp_to_limits(text)
+    # Для X применяем только лимит X (а не общий X+Farcaster), иначе текст режется слишком агрессивно.
+    clean = clamp_to_x_text(text)
     payload: dict = {"text": clean}
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
-    # Убираем предпросмотр ссылок - добавляем card_uri для отключения карточек
+    # Предпросмотр ссылок: отключаем только если X_SUPPRESS_LINK_PREVIEWS=1 (tombstone)
     # Важно: X API запрещает передавать одновременно media и card_uri (ошибка 400).
-    # Поэтому card_uri ставим только когда НЕТ медиа.
-    if (not media_ids) and _URL_RE.search(clean):
+    if _X_SUPPRESS_LINK_PREVIEWS and (not media_ids) and _URL_RE.search(clean):
         payload["card_uri"] = "tombstone://card"
     # Если это ответ в треде - добавляем reply
     if reply_to_tweet_id:
@@ -661,7 +748,8 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None, reply_to_ha
         "x-api-key": NEYNAR_API_KEY,
         "Content-Type": "application/json",
     }
-    clean = clamp_to_limits(text)
+    # Для Farcaster применяем только лимит Farcaster (байты UTF-8).
+    clean = clamp_to_farcaster_text(text)
     payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "text": clean}
     # Добавляем в embeds только изображения (не ссылки), чтобы ссылки были без предпросмотра
     if embeds:
@@ -722,6 +810,14 @@ def delete_farcaster_cast(cast_hash: str) -> dict:
         data = resp.json() if resp.text else {}
         if resp.status_code in (200, 204):
             return {"ok": True}
+        # На бесплатном Neynar удаление каста часто 402 — не блокируем репост при правке
+        if resp.status_code == 402:
+            try:
+                msg = (data.get("message") or data.get("code") or "") if isinstance(data, dict) else ""
+            except Exception:
+                msg = ""
+            print(f"ℹ️ Neynar delete cast: 402 (план), пропуск удаления: {msg}")
+            return {"ok": True, "skipped": True, "reason": "neynar_payment_required"}
         return {"ok": False, "status": resp.status_code, "body": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -830,6 +926,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     try:
+        if _SEPARATE_XF:
+            tx, tfc = await translate_social_texts(user_text)
+            if not tx and not tfc:
+                await msg.edit_text("❌ Не смог получить перевод. Попробуй ещё раз.")
+                return
+            context.user_data["post_x"] = tx
+            context.user_data["post_fc"] = tfc
+            context.user_data["post_0"] = None
+            preview = (
+                f"EN — раздельно для X и Farcaster.\n\n"
+                f"X ({x_effective_length(tx)}/{X_MAX_CHARS} X-eff):\n{tx}\n\n"
+                f"Farcaster ({len(tfc.encode('utf-8'))}/{FARCASTER_MAX_BYTES} bytes):\n{tfc}"
+            )
+            if len(preview) > 4000:
+                preview = preview[:3980] + "…"
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚀 X + Farcaster", callback_data="send_0")]]
+            )
+            await msg.edit_text(
+                preview,
+                reply_markup=keyboard,
+            )
+            return
+
         # Используем Grok для X постов если доступен, иначе Gemini
         translated = await _translate_section(user_text, for_x=True)
 
@@ -1016,28 +1136,35 @@ def split_long_post(text: str) -> List[str]:
     return sections
 
 
-async def auto_post_to_socials(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
+async def auto_post_to_socials(
+    text: str,
+    photo_file_id: Optional[str] = None,
+    bot=None,
+    do_x: bool = True,
+    do_fc: bool = True,
+) -> dict:
     """
     Автоматически переводит текст и публикует в X + Farcaster без кнопок.
     Используется для автопостинга из каналов.
-    Если пост очень длинный - разбивает на тред (thread) с ответами.
+    do_x / do_fc: из env AUTOPOST_X / AUTOPOST_FARCASTER и из директив #no_x / #no_fc
     """
     if not text:
         return {"ok": False, "error": "No text to post"}
+    if not do_x and not do_fc:
+        return {"ok": False, "error": "Both platforms disabled (do_x=0, do_fc=0)"}
     
-    # Проверяем, нужно ли разбивать пост (если он явно длинный и структурированный)
-    text_length = len(text.encode('utf-8'))
-    should_split = text_length > 500 and ('•' in text or '\n-' in text or re.search(r'^\d+[\.\)]', text, re.MULTILINE))
+    # Тред только для длинных дайджестов; порог задаётся AUTOPOST_THREAD_MIN_BYTES
+    text_length = len(text.encode("utf-8"))
+    should_split = text_length > AUTOPOST_THREAD_MIN_BYTES and (
+        "•" in text or "\n-" in text or re.search(r"^\d+[\.\)]", text, re.MULTILINE)
+    )
     
     if should_split:
-        # Разбиваем на секции
         sections = split_long_post(text)
         if len(sections) > 1:
-            # Публикуем как тред (thread)
-            return await _post_as_thread(sections, photo_file_id, bot)
+            return await _post_as_thread(sections, photo_file_id, bot, do_x, do_fc)
     
-    # Обычная публикация одного поста
-    return await _post_single_section(text, photo_file_id, bot)
+    return await _post_single_section(text, photo_file_id, bot, do_x, do_fc)
 
 
 def _extract_social_ids(result: dict) -> Tuple[List[str], List[str]]:
@@ -1084,64 +1211,86 @@ def _delete_previous_social_posts(record: dict) -> Tuple[List[str], List[str]]:
     return errors_x, errors_fc
 
 
-async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = None, bot=None) -> dict:
+async def _post_as_thread(
+    sections: List[str],
+    photo_file_id: Optional[str] = None,
+    bot=None,
+    do_x: bool = True,
+    do_fc: bool = True,
+) -> dict:
     """
     Публикует несколько секций как тред (thread) в X и Farcaster.
     Первый пост - основной, остальные - ответы с задержкой 2-3 секунды.
     """
     load_dotenv(_load_env_path, override=True)
-    
-    # Переводим все секции (для X используем Grok если доступен)
-    translated_sections = []
+    pairs: List[Tuple[str, str]] = []
     for section in sections:
-        translated = await _translate_section(section, for_x=True)
-        if translated:
-            translated_sections.append(translated)
-    
-    if not translated_sections:
+        tx, tfc = await translate_social_texts(section)
+        if tx is None and tfc is None:
+            return {"ok": False, "error": "Translation failed"}
+        pairs.append(((tx or "").strip(), (tfc or "").strip()))
+    if not pairs:
         return {"ok": False, "error": "Translation failed"}
     
-    # Публикуем первый пост
-    first_section = translated_sections[0]
     media_ids = None
     farcaster_embeds = None
-    
     if photo_file_id and bot:
         media_ids, farcaster_embeds, _ = await process_and_upload_photo(photo_file_id, bot)
     
-    result_x = post_to_x(first_section, media_ids=media_ids)
-    result_fc = post_to_farcaster(first_section, embeds=farcaster_embeds)
+    first_x, first_fc = pairs[0]
+    if do_x and first_x:
+        result_x = post_to_x(first_x, media_ids=media_ids)
+    else:
+        result_x = {"ok": True, "skipped": True, "id": None}
+    if do_fc and first_fc:
+        result_fc = post_to_farcaster(first_fc, embeds=farcaster_embeds)
+    else:
+        result_fc = {"ok": True, "skipped": True, "hash": None}
     
-    x_thread_id = result_x.get("id") if result_x.get("ok") else None
-    fc_thread_hash = result_fc.get("hash") if result_fc.get("ok") else None
+    x_thread_id: Optional[str] = (
+        str(result_x["id"]) if (result_x.get("ok") and not result_x.get("skipped") and result_x.get("id")) else None
+    )
+    fc_thread_hash: Optional[str] = (
+        str(result_fc["hash"])
+        if (result_fc.get("ok") and not result_fc.get("skipped") and result_fc.get("hash"))
+        else None
+    )
     
-    # Публикуем остальные посты как ответы с задержкой
-    x_replies = [result_x] if result_x.get("ok") else []
-    fc_replies = [result_fc] if result_fc.get("ok") else []
+    x_replies: List[dict] = [result_x]
+    fc_replies: List[dict] = [result_fc]
     
-    for i, section in enumerate(translated_sections[1:], start=1):
-        # Задержка 2-3 секунды между постами (чтобы не триггерить rate limits)
+    for sx, sfc in pairs[1:]:
         await asyncio.sleep(2.5)
-        
-        if x_thread_id:
-            x_reply = post_to_x(section, reply_to_tweet_id=x_thread_id)
+        if do_x and x_thread_id and sx:
+            x_reply = post_to_x(sx, reply_to_tweet_id=x_thread_id)
             x_replies.append(x_reply)
-            if x_reply.get("ok"):
-                x_thread_id = x_reply.get("id")  # Обновляем для следующего ответа
-        
-        if fc_thread_hash:
-            fc_reply = post_to_farcaster(section, reply_to_hash=fc_thread_hash)
+            if x_reply.get("ok") and x_reply.get("id"):
+                x_thread_id = str(x_reply.get("id"))
+        else:
+            x_replies.append(
+                {"ok": True, "skipped": True, "id": None}
+                if (not do_x or not sx)
+                else {"ok": False, "error": "X thread not started"}
+            )
+        if do_fc and fc_thread_hash and sfc:
+            fc_reply = post_to_farcaster(sfc, reply_to_hash=fc_thread_hash)
             fc_replies.append(fc_reply)
-            if fc_reply.get("ok"):
-                fc_thread_hash = fc_reply.get("hash")  # Обновляем для следующего ответа
+            if fc_reply.get("ok") and fc_reply.get("hash"):
+                fc_thread_hash = str(fc_reply.get("hash"))
+        else:
+            fc_replies.append(
+                {"ok": True, "skipped": True, "hash": None}
+                if (not do_fc or not sfc)
+                else {"ok": False, "error": "Farcaster thread not started"}
+            )
     
-    x_success = sum(1 for r in x_replies if r.get("ok"))
-    fc_success = sum(1 for r in fc_replies if r.get("ok"))
+    x_success = sum(1 for r in x_replies if r.get("ok") and r.get("id") and not r.get("skipped"))
+    fc_success = sum(1 for r in fc_replies if r.get("ok") and r.get("hash") and not r.get("skipped"))
     
     return {
         "ok": x_success > 0 or fc_success > 0,
         "thread": True,
-        "posts_count": len(translated_sections),
+        "posts_count": len(pairs),
         "x": {"success": x_success, "total": len(x_replies), "replies": x_replies},
         "farcaster": {"success": fc_success, "total": len(fc_replies), "replies": fc_replies},
     }
@@ -1150,6 +1299,9 @@ async def _post_as_thread(sections: List[str], photo_file_id: Optional[str] = No
 async def _translate_with_grok(text: str, for_x: bool = True) -> Optional[str]:
     """Переводит текст используя Grok (xAI) - оптимизировано для алгоритма X 2025."""
     if not client_grok:
+        return None
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
         return None
 
     entity_hints = _build_project_entity_hints(text)
@@ -1165,7 +1317,7 @@ Return a compact JSON with keys:
 - "numbers": [{{"value": "...", "context": "...", "evidence": "exact quote"}}]
 - "claims": [{{"claim": "...", "evidence": "exact quote"}}]
 - "author_tone": "angry|sarcastic|neutral|excited|disappointed|warning|etc" (best guess)
-- "call_to_action_seed": "a single short question that would drive replies" (must be consistent with source)
+- "urls_in_source": ["https://..."]  (list every http(s) URL that appears in the source, verbatim)
 
 HINTS (may include handles; ticker only if present in source):
 {entity_hints if entity_hints else "- (none)"}
@@ -1174,94 +1326,86 @@ SOURCE:
 {text}
 """.strip()
 
-    def _grok_chat(messages: list, temperature: float, retries: int = 2) -> Optional[str]:
-        last_err = None
-        for attempt in range(retries + 1):
-            try:
-                url = "https://api.x.ai/v1/chat/completions"
-                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {client_grok}"}
-                payload = {"model": GROK_MODEL, "messages": messages, "temperature": temperature, "stream": False}
-                resp = requests.post(url, json=payload, headers=headers, timeout=30)
-                data = resp.json()
-                if resp.status_code == 200 and "choices" in data:
-                    return (data["choices"][0]["message"]["content"] or "").strip()
-                last_err = f"status={resp.status_code} body={data}"
-                print(f"❌ Grok API error (attempt {attempt+1}/{retries+1}): {last_err}")
-            except Exception as e:
-                last_err = str(e)
-                print(f"Grok API error (attempt {attempt+1}/{retries+1}): {e}")
-            if attempt < retries:
-                time.sleep(1.2 * (attempt + 1))
-        print(f"❌ Grok окончательно не ответил: {last_err}")
-        return None
-
-    fact_sheet_raw = _grok_chat(
+    fact_sheet_raw = _grok_request(
         [
             {"role": "system", "content": "You output only valid JSON. No markdown."},
             {"role": "user", "content": fact_prompt},
         ],
         temperature=0.0,
+        retries=2,
     )
     if not fact_sheet_raw:
         # fallback: работаем без fact-sheet, чтобы не терять автопостинг
         print("⚠️ Fact-sheet шаг Grok не удался, fallback на single-pass rewrite")
         fact_sheet_raw = "{}"
-    
-    prompt = f"""
-You are Grok, an expert at creating viral X (Twitter) content optimized for MAXIMUM VIEWS and COMMENTS in 2025.
 
-PRIMARY GOAL: Maximize views and comments, not hashtags. Hashtags are OPTIONAL - only add if they genuinely boost discoverability.
+    if _X_FAITHFUL:
+        prompt = f"""
+You are Grok. Translate the SOURCE from Russian into natural English for X (Twitter).
 
-CRITICAL X ALGORITHM OPTIMIZATION (2025):
-1. ENGAGEMENT VELOCITY: First 60 minutes are critical. Add hooks that prompt immediate replies/questions.
-2. REPLIES > LIKES: End with a question, controversial statement, or call-to-action that provokes discussion.
-3. SPECIFICITY: Use concrete details, numbers, specific examples instead of vague statements.
-4. CONVERSATION STARTERS: Frame content to invite replies, not just passive consumption.
-5. CONTROVERSY & DEBATE: If appropriate, add elements that spark discussion (but stay truthful).
+NON-NEGOTIABLE:
+- Faithful to meaning and tone. Not a "growth hack" rewrite. No fake enthusiasm layered on top.
+- Include EVERY http(s) URL that appears in the SOURCE (same string). Keep "text (https://...)" format when the source has it.
+- No markdown. Strip ** _ ` if the source had markdown-like noise.
+- Do NOT add a question at the end unless the Russian source is already asking the reader something in that part.
+- Do NOT add engagement filler: no "spill the tea", "hot take", "let me know", "thoughts?", "change my mind", "what's your take", "drop your" unless those ideas are in the source.
+- Do NOT add hashtags unless the source already has them.
+- @mention and $TICKER only if present in the source. PROJECT HINTS may disambiguate handles; never invent tickers.
+- If the source is a list of news bullets, you may keep short bullets, but do not turn each into a separate marketing pitch.
+- Max output: X effective length <= {X_MAX_CHARS} (URL counts as {X_TCO_URL_LEN} each), Farcaster UTF-8 <= {FARCASTER_MAX_BYTES} bytes.
 
-TRANSLATION RULES:
-- Translate from Russian to English naturally
-- Preserve ALL URLs exactly: "link_text (https://...)" format
-- Keep structure: bullets, line breaks, numbered lists
-- Remove markdown (** _ `) - X doesn't render it well
-
-VIRAL OPTIMIZATION (focus on views & comments):
-- END WITH A QUESTION or controversial statement to drive replies (CRITICAL - this is more important than hashtags)
-- Use specific numbers, metrics, concrete examples
-- Make it conversational, engaging, and debate-worthy
-- If the source mentions a project/token, HIGHLIGHT it for X discovery:
-  - Use @mention if you know the correct official handle.
-  - Use $TICKER ONLY if the ticker is explicitly present in the source text.
-  - Do NOT invent handles/tickers. If you aren't sure, keep the plain name.
-- REQUIRED: include at least one discoverability anchor in the final tweet (@mention OR #hashtag) when a project is present in source.
-- HASHTAGS: Add ONLY if they genuinely help discoverability AND don't hurt readability. Skip hashtags if the tweet is already strong without them. If adding, use 1-2 max: #Crypto #Web3 #AI #Tech #DeFi #NFT #Blockchain #BuildInPublic #TechTwitter
-- Prioritize engagement hooks over hashtags - a question at the end is worth more than 5 hashtags
-
-OUTPUT: Only the optimized tweet text, ready to post. Max 280 chars for X. Focus on driving comments and views, not hashtag stuffing. No explanations.
-
-PROJECT/TICKER HINTS (handles from config; ticker only if present in source):
+PROJECT/TICKER HINTS (ticker only if present in source):
 {entity_hints if entity_hints else "- (none)"}
 
-FACT SHEET (ground truth; do not contradict; do not add new facts beyond this):
+FACT SHEET (ground truth; do not add new facts):
 {fact_sheet_raw}
 
-Original post:
+SOURCE:
 {text}
+
+OUTPUT: Only the English post text, nothing else.
+""".strip()
+    else:
+        prompt = f"""
+You are Grok, expert at X (Twitter) posts. Translate from Russian to English; stay factual; avoid generic "AI post" feel.
+
+Rules:
+- Preserve ALL URLs exactly (including "label (https://...)" and bare https links).
+- Remove markdown (** _ `). Keep bullets/line breaks if useful.
+- You MAY end with a sharp line or a real open question, but do NOT use cliché engagement questions (no "spill the tea", "thoughts?", "agree?").
+- @mention / $TICKER only if in the source. Project hints: {entity_hints if entity_hints else "- (none)"}
+- Hashtags: at most 1-2, only if they fit; not required.
+- Max: X effective <= {X_MAX_CHARS} (URL ~{X_TCO_URL_LEN} each), Farcaster <= {FARCASTER_MAX_BYTES} bytes.
+
+FACT SHEET (ground truth):
+{fact_sheet_raw}
+
+SOURCE:
+{text}
+
+OUTPUT: Only the English post, no commentary.
 """.strip()
     
     try:
-        raw_translated = _grok_chat(
+        grok_temp = 0.45 if _X_FAITHFUL else 0.75
+        raw_translated = _grok_request(
             [
                 {
                     "role": "system",
-                    "content": "You write like a human crypto/tech operator on X. Be punchy, specific, provocative (but factual).",
+                    "content": (
+                        "You write clear English. You are not a customer-support bot. No engagement bait. "
+                        "Respect the source."
+                        if _X_FAITHFUL
+                        else "You write like a sharp crypto/tech X account: concise, specific, not formulaic."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.8,
+            temperature=grok_temp,
         )
         if raw_translated:
             translated = normalize_social_text(raw_translated)
+            translated = ensure_urls_preserved(text, translated)
             translated = _avoid_cutting_url(translated)
             
             if not translated:
@@ -1317,6 +1461,7 @@ User post:
         response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt_translate)
         raw_translated = (response.text or "").strip()
         translated = normalize_social_text(raw_translated)
+        translated = ensure_urls_preserved(text, translated)
         translated = _avoid_cutting_url(translated)
         
         if not translated:
@@ -1354,6 +1499,148 @@ Full English translation to shorten:
         return None
 
 
+def _parse_dual_json_raw(raw: str) -> Optional[Tuple[str, str]]:
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*\n", "", s)
+        s = re.sub(r"\n```\s*$", "", s)
+    try:
+        o = json.loads(s)
+    except json.JSONDecodeError:
+        a, b = s.find("{"), s.rfind("}")
+        if a != -1 and b > a:
+            try:
+                o = json.loads(s[a : b + 1])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+    if not isinstance(o, dict):
+        return None
+    xs = o.get("x")
+    fcs = o.get("farcaster")
+    if not isinstance(xs, str):
+        xs = o.get("twitter")
+    if not isinstance(fcs, str):
+        fcs = o.get("fc") or o.get("warpcast")
+    if not isinstance(xs, str) or not isinstance(fcs, str):
+        return None
+    return (xs.strip(), fcs.strip())
+
+
+def _finalize_dual_texts(source: str, x_raw: str, fc_raw: str) -> Tuple[str, str]:
+    x_t = ensure_urls_preserved(source, normalize_social_text(x_raw))
+    fc_t = ensure_urls_preserved(source, normalize_social_text(fc_raw))
+    x_t = _avoid_cutting_url(x_t)
+    fc_t = _avoid_cutting_url(fc_t)
+    x_t = clamp_to_x_text(x_t)
+    fc_t = clamp_to_farcaster_text(fc_t)
+    return x_t, fc_t
+
+
+def _translate_dual_grok_block(source: str) -> Optional[Tuple[str, str]]:
+    if not client_grok:
+        return None
+    if _grok_circuit_is_open():
+        _grok_log_circuit_block()
+        return None
+    hints = _build_project_entity_hints(source)
+    hint_block = f"PROJECT HINTS (ticker only if in source):\n{hints}\n" if hints else ""
+    faithful = _X_FAITHFUL
+    x_line = (
+        "Twitter: max X effective length {0} (URL ≈{1} chars). Faithful; no engagement-bait; preserve URLs; no # unless in source."
+    ).format(X_MAX_CHARS, X_TCO_URL_LEN)
+    if not faithful:
+        x_line = "Twitter: strong hook, same facts, max {0} effective, preserve URLs".format(X_MAX_CHARS)
+    fc_line = (
+        "Farcaster: same core facts, tighter crypto/builder voice, no hashtag spam, "
+        "max {0} UTF-8 bytes, preserve URLs, no 'thoughts?' style filler"
+    ).format(FARCASTER_MAX_BYTES)
+    prompt = f"""Translate the Russian SOURCE into English for two outputs. Reply with ONLY a JSON object (no ``` fence):
+{{"x": "<string>", "farcaster": "<string>"}}
+
+{hint_block}
+For "x": {x_line}
+For "farcaster": {fc_line}
+Rules for both: translate faithfully; all http(s) from source must appear; @ / $ only if in source; no markdown; no new facts.
+
+SOURCE:
+{source}
+""".strip()
+    raw = _grok_request(
+        [
+            {
+                "role": "system",
+                "content": "Output a single JSON object with keys x and farcaster. Strings in double quotes. No markdown, no other keys.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.4 if faithful else 0.65,
+    )
+    if not raw:
+        return None
+    pr = _parse_dual_json_raw(raw)
+    if not pr:
+        print("⚠️ Grok dual: не распарсили JSON")
+        return None
+    return _finalize_dual_texts(source, pr[0], pr[1])
+
+
+def _translate_dual_gemini_block(source: str) -> Optional[Tuple[str, str]]:
+    if not client_ai or not MODEL_NAME:
+        return None
+    h = _build_project_entity_hints(source)
+    hint_block = f"\nHINTS:\n{h}\n" if h else ""
+    prompt = f"""Output ONLY this JSON, no other text, no ```:
+{{"x": "<string>", "farcaster": "<string>"}}
+Translate Russian SOURCE to English.
+Field "x": for Twitter, max {X_MAX_CHARS} effective (URL as {X_TCO_URL_LEN} each). Be faithful; do not add hashtag spam. Preserve all URLs.
+Field "farcaster": for Farcaster cast, max {FARCASTER_MAX_BYTES} UTF-8 bytes, shorter, builder/crypto tone, fewer hashtags, preserve URLs.
+{hint_block}SOURCE:
+{source}""".strip()
+    try:
+        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt)
+        r = (response.text or "").strip()
+        pr = _parse_dual_json_raw(r)
+        if not pr:
+            return None
+        return _finalize_dual_texts(source, pr[0], pr[1])
+    except Exception as e:
+        print(f"❌ Gemini dual: {e}")
+        return None
+
+
+async def translate_social_texts(source_text: str) -> Tuple[Optional[str], Optional[str]]:
+    if not (source_text and source_text.strip()):
+        return (None, None)
+    if not _SEPARATE_XF:
+        s = await _translate_section(source_text, for_x=True)
+        if s:
+            s = ensure_urls_preserved(source_text, s)
+            s2 = clamp_to_limits(s)
+            return (s2, s2)
+        return (None, None)
+    t = _translate_dual_grok_block(source_text)
+    if t:
+        print("✅ Dual: Grok (x + farcaster)")
+        return t[0], t[1]
+    t = _translate_dual_gemini_block(source_text)
+    if t:
+        print("✅ Dual: Gemini (x + farcaster)")
+        return t[0], t[1]
+    if client_ai and MODEL_NAME:
+        s = await _translate_with_gemini(source_text)
+        if s:
+            s2 = ensure_urls_preserved(source_text, s)
+            s2 = clamp_to_limits(s2)
+            return (s2, s2)
+    if client_grok:
+        s = await _translate_with_grok(source_text, for_x=True)
+        if s:
+            return s, s
+    return (None, None)
+
+
 async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
     """Переводит одну секцию текста. Использует Grok для X постов, Gemini для остального."""
     # Для X постов используем Grok если доступен
@@ -1361,53 +1648,55 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
         print(f"🤖 Используется Grok для перевода X поста...")
         result = await _translate_with_grok(text, for_x=True)
         if result:
-            return _ensure_discovery_anchor(result, text)
+            return result
         # Fallback на Gemini если Grok не сработал
         print("⚠️ Grok failed, falling back to Gemini")
         if client_ai and MODEL_NAME:
-            g = await _translate_with_gemini(text)
-            return _ensure_discovery_anchor(g, text) if g else None
+            return await _translate_with_gemini(text)
         return None
     
     # Используем Gemini для Farcaster или если Grok недоступен
     if client_ai and MODEL_NAME:
         print(f"🤖 Используется Gemini для перевода...")
-        g = await _translate_with_gemini(text)
-        return _ensure_discovery_anchor(g, text) if (for_x and g) else g
+        return await _translate_with_gemini(text)
     return None
 
 
-async def _post_single_section(text: str, photo_file_id: Optional[str] = None, bot=None) -> dict:
-    """
-    Публикует одну секцию поста (вспомогательная функция).
-    Использует Grok для X постов если доступен.
-    """
-    
-    # Переводим текст (Grok для X, Gemini для остального)
-    translated = await _translate_section(text, for_x=True)
-    
-    if not translated:
+async def _post_single_section(
+    text: str,
+    photo_file_id: Optional[str] = None,
+    bot=None,
+    do_x: bool = True,
+    do_fc: bool = True,
+) -> dict:
+    """Одна публикация: раздельные тексты X / FC при SEPARATE_X_FARCASTER=1."""
+    tx, tfc = await translate_social_texts(text)
+    if (tx is None or not str(tx).strip()) and (tfc is None or not str(tfc).strip()):
         return {"ok": False, "error": "Translation failed"}
-    
-    final_text = clamp_to_limits(translated)
-    
     try:
-        # Загружаем фото если есть
         media_ids = None
         farcaster_embeds = None
         if photo_file_id and bot:
             media_ids, farcaster_embeds, _ = await process_and_upload_photo(photo_file_id, bot)
-        
-        # Публикуем
         load_dotenv(_load_env_path, override=True)
-        result_x = post_to_x(final_text, media_ids=media_ids)
-        result_fc = post_to_farcaster(final_text, embeds=farcaster_embeds)
-        
+        if do_x and tx and tx.strip():
+            result_x = post_to_x(tx, media_ids=media_ids)
+        else:
+            result_x = {"ok": True, "skipped": True, "id": None}
+        if do_fc and tfc and tfc.strip():
+            result_fc = post_to_farcaster(tfc, embeds=farcaster_embeds)
+        else:
+            result_fc = {"ok": True, "skipped": True, "hash": None}
+        published = bool(
+            (result_x.get("ok") and result_x.get("id"))
+            or (result_fc.get("ok") and result_fc.get("hash"))
+        )
         return {
-            "ok": result_x.get("ok") or result_fc.get("ok"),
+            "ok": published,
             "x": result_x,
             "farcaster": result_fc,
-            "text": final_text,
+            "text": tx,
+            "text_farcaster": tfc,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1419,7 +1708,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split("_")
     idx = parts[1] if len(parts) > 1 else "0"
 
-    text_to_post = context.user_data.get(f"post_{idx}")
+    px, pfc = context.user_data.get("post_x"), context.user_data.get("post_fc")
+    if _SEPARATE_XF and px is not None and pfc is not None and idx == "0":
+        text_x, text_fc = px, pfc
+    else:
+        text_to_post = context.user_data.get(f"post_{idx}")
+        if not text_to_post:
+            await query.edit_message_text("❌ Нет текста. Пришли пост заново.")
+            return
+        text_x, text_fc = text_to_post, text_to_post
+
     photo_file_id = context.user_data.get("last_photo_file_id")
 
     await query.edit_message_text(text="📤 Отправка в X + Farcaster...")
@@ -1430,8 +1728,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     load_dotenv(_load_env_path, override=True)
-    result_x = post_to_x(text_to_post, media_ids=media_ids)
-    result_fc = post_to_farcaster(text_to_post, embeds=farcaster_embeds)
+    result_x = post_to_x(text_x, media_ids=media_ids) if text_x else {"ok": True, "skipped": True, "id": None}
+    result_fc = post_to_farcaster(text_fc, embeds=farcaster_embeds) if text_fc else {"ok": True, "skipped": True, "hash": None}
 
     lines = []
     if result_x.get("ok"):
@@ -1455,7 +1753,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if skipped_photo_reason:
         lines.append(f"📷 Photo: skipped ({skipped_photo_reason})")
 
-    lines.append("\nТекст:\n" + text_to_post)
+    if px is not None and pfc is not None and _SEPARATE_XF and idx == "0":
+        lines.append("\nX:\n" + (text_x or ""))
+        lines.append("\nFarcaster:\n" + (text_fc or ""))
+    else:
+        lines.append(
+            "\nТекст:\n" + (context.user_data.get(f"post_{idx}") or (text_x or ""))
+        )
     await query.edit_message_text(text="\n".join(lines))
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,28 +1777,65 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = channel_post.chat.id
     message_id = channel_post.message_id
     is_edited = bool(update.edited_channel_post)
-    print(f"📢 Получен пост из канала {chat_id}")
+    fu = channel_post.from_user
+    print(f"📢 channel_post chat_id={chat_id} msg_id={message_id} from={fu.id if fu else None} is_bot={fu.is_bot if fu else None}")
     
     # Если указаны конкретные каналы — проверяем
     if AUTOPOST_CHANNEL_IDS and chat_id not in AUTOPOST_CHANNEL_IDS:
         print(f"⚠️ Канал {chat_id} не в списке разрешенных: {AUTOPOST_CHANNEL_IDS}")
         return
     
-    # Игнорируем посты от самого бота (чтобы избежать циклов)
-    if channel_post.from_user and channel_post.from_user.is_bot:
-        print(f"⚠️ Игнорируем пост от бота")
-        return
+    # Только посты этого же бота отсекаем (анти-цикл). Посты через других ботов / планировщики — обрабатываем.
+    if fu and fu.is_bot:
+        try:
+            our_id = context.bot.id
+        except AttributeError:
+            our_id = (await context.bot.get_me()).id
+        if fu.id == our_id:
+            print("⚠️ Игнорируем пост от этого же бота (анти-цикл)")
+            return
+        print(f"ℹ️ Пост от другого бота id={fu.id}, обрабатываем")
     
     user_text, photos = extract_text_and_photos(channel_post)
+    media_group_id = getattr(channel_post, "media_group_id", None)
     if not user_text:
-        print(f"⚠️ Нет текста в посте (только фото без подписи?)")
+        if media_group_id is not None and photos:
+            print(
+                f"ℹ️ Альбом (media_group_id={media_group_id}): кадр без подписи — пропуск, ждём кадр с текстом"
+            )
+            return
+        print(f"⚠️ Нет текста в посте (одно фото/видео без подписи или пустой пост)")
         return
-    
-    print(f"✅ Обрабатываем пост из канала {chat_id}, текст: {user_text[:50]}...")
+
+    body, want_x, want_fc, only_tg = parse_channel_post_directives(user_text)
+    if only_tg:
+        print("ℹ️ #only_tg: автопост в X/FC пропущен (только Telegram)")
+        return
+    if not (body and body.strip()):
+        print("⚠️ Пустой текст после директив")
+        return
+    do_m_x = want_x and _AUTOP_X
+    do_m_fc = want_fc and _AUTOP_FC
+    if not do_m_x and not do_m_fc:
+        print("⏭️ Автопост: X и Farcaster выключены (env + директивы), пропуск")
+        return
+
+    print(f"✅ Обрабатываем пост из канала {chat_id}, текст: {body[:50]}...")
     photo_file_id = photos[-1].file_id if photos else None
+    content_fingerprint = hashlib.md5(body.encode("utf-8")).hexdigest()
 
     # Если это редактирование в течение 5 минут — удаляем старые посты и публикуем заново
     state = _load_autopost_state()
+    if AUTOPOST_DEDUPE_HOURS > 0 and not is_edited:
+        ded = state.get("_dedupe")
+        if not isinstance(ded, dict):
+            ded = {}
+        last_posted = ded.get(content_fingerprint)
+        if last_posted is not None and (int(time.time()) - int(last_posted)) < AUTOPOST_DEDUPE_HOURS * 3600:
+            print(
+                f"⏭️ Автопост: тот же текст уже уходил в X/FC в последние {AUTOPOST_DEDUPE_HOURS}h, пропуск (дедуп)"
+            )
+            return
     state_key = f"{chat_id}:{message_id}"
     prev_record = state.get(state_key)
     if is_edited and prev_record:
@@ -1510,7 +1851,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(f"ℹ️ Редактирование позже окна {AUTOPOST_EDIT_WINDOW_SECONDS}s — удаление пропущено")
     
     # Автоматически публикуем
-    result = await auto_post_to_socials(user_text, photo_file_id, context.bot)
+    result = await auto_post_to_socials(body, photo_file_id, context.bot, do_m_x, do_m_fc)
 
     # Сохраняем связь channel message -> social ids для последующего delete/repost
     if result.get("ok"):
@@ -1522,6 +1863,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             "x_ids": x_ids,
             "fc_hashes": fc_hashes,
         }
+        if AUTOPOST_DEDUPE_HOURS > 0:
+            dmap = state.get("_dedupe")
+            if not isinstance(dmap, dict):
+                dmap = {}
+            dmap[content_fingerprint] = int(time.time())
+            state["_dedupe"] = dmap
         _save_autopost_state(state)
     
     # Формируем сообщение о результате
@@ -1532,6 +1879,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         posts_count = result.get("posts_count", 0)
         x_info = result.get("x", {})
         fc_info = result.get("farcaster", {})
+        x_replies = x_info.get("replies") or []
+        fc_replies = fc_info.get("replies") or []
+
+        def _first_reply_err(replies):
+            for rr in replies:
+                if rr.get("ok"):
+                    continue
+                e = rr.get("error") or rr.get("body")
+                if e:
+                    return str(e)
+            return None
         
         lines = [f"🧵 Тред из {posts_count} постов:"]
         
@@ -1539,29 +1897,43 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         x_total = x_info.get("total", 0)
         if x_success > 0:
             lines.append(f"✅ X: {x_success}/{x_total} постов опубликовано")
+            if x_success < x_total:
+                x_err = _first_reply_err(x_replies)
+                lines.append(f"⚠️ X: часть постов не вышла ({x_total - x_success} шт){': ' + x_err if x_err else ''}")
         else:
-            lines.append(f"❌ X: не удалось опубликовать")
+            x_err = _first_reply_err(x_replies)
+            lines.append(f"❌ X: не удалось опубликовать{': ' + x_err if x_err else ''}")
         
         fc_success = fc_info.get("success", 0)
         fc_total = fc_info.get("total", 0)
         if fc_success > 0:
             lines.append(f"✅ Farcaster: {fc_success}/{fc_total} постов опубликовано")
+            if fc_success < fc_total:
+                fc_err = _first_reply_err(fc_replies)
+                lines.append(
+                    f"⚠️ Farcaster: часть постов не вышла ({fc_total - fc_success} шт){': ' + fc_err if fc_err else ''}"
+                )
         else:
-            lines.append(f"❌ Farcaster: не удалось опубликовать")
+            fc_err = _first_reply_err(fc_replies)
+            lines.append(f"❌ Farcaster: не удалось опубликовать{': ' + fc_err if fc_err else ''}")
     else:
         # Обычный пост
         result_x = result.get("x", {})
         result_fc = result.get("farcaster", {})
         
         lines = []
-        if result_x.get("ok"):
+        if result_x.get("id") and result_x.get("ok"):
             lines.append("✅ X: опубликовано")
+        elif result_x.get("skipped"):
+            lines.append("⏭️ X: пропуск (AUTOPOST_X=0 / #no_x)")
         else:
             err = result_x.get("error") or result_x.get("body") or result_x
             lines.append(f"❌ X: {err}")
         
-        if result_fc.get("ok"):
+        if result_fc.get("hash") and result_fc.get("ok"):
             lines.append("✅ Farcaster: опубликовано")
+        elif result_fc.get("skipped"):
+            lines.append("⏭️ Farcaster: пропуск (AUTOPOST_FARCASTER=0 / #no_fc)")
         else:
             err = result_fc.get("error") or result_fc.get("body") or result_fc
             lines.append(f"❌ Farcaster: {err}")
@@ -1585,8 +1957,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         result_x = result.get("x", {})
         result_fc = result.get("farcaster", {})
-        x_link = x_tweet_url(result_x.get("id")) if result_x.get("ok") else None
-        fc_link = farcaster_cast_url(result_fc.get("hash")) if result_fc.get("ok") else None
+        x_link = x_tweet_url(result_x.get("id")) if (result_x.get("id") and result_x.get("ok")) else None
+        fc_link = farcaster_cast_url(result_fc.get("hash")) if (result_fc.get("hash") and result_fc.get("ok")) else None
 
         notify_lines.append(f"📤 Автопост из канала {chat_id}")
         notify_lines.extend(lines)
@@ -1597,11 +1969,50 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     result_msg = "\n".join(notify_lines)
     
-    # Логируем в консоль
-    if result.get("ok"):
-        print(f"✅ Автопост из канала {chat_id}: опубликовано в X/Farcaster")
+    # Логируем в консоль раздельно по платформам (для треда структура x/fc — success/total/replies, не ok/id)
+    rx = result.get("x") or {}
+    rf = result.get("farcaster") or {}
+    if result.get("thread"):
+        xs, xt = int(rx.get("success") or 0), int(rx.get("total") or 0)
+        fs, ft = int(rf.get("success") or 0), int(rf.get("total") or 0)
+        x_replies = rx.get("replies") or []
+        fc_replies = rf.get("replies") or []
+        first_x = next((r.get("id") for r in x_replies if r.get("ok") and r.get("id")), None)
+        first_fc = next((r.get("hash") for r in fc_replies if r.get("ok") and r.get("hash")), None)
+        x_full = xt > 0 and xs >= xt
+        fc_full = ft > 0 and fs >= ft
+        if x_full and fc_full:
+            print(
+                f"✅ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft} "
+                f"(корень x={first_x} fc={first_fc})"
+            )
+        elif xs > 0 or fs > 0:
+            print(
+                f"⚠️ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft} "
+                f"(корень x={first_x} fc={first_fc})"
+            )
+        else:
+            print(f"❌ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft}")
     else:
-        print(f"❌ Автопост из канала {chat_id}: ошибка - {result.get('error', result)}")
+        x_ok = bool(rx.get("ok") and rx.get("id"))
+        fc_ok = bool(rf.get("ok") and rf.get("hash"))
+        if x_ok and fc_ok:
+            print(f"✅ Автопост из канала {chat_id}: X+Farcaster ok (x_id={rx.get('id')} fc_hash={rf.get('hash')})")
+        elif x_ok and not fc_ok:
+            print(
+                f"⚠️ Автопост из канала {chat_id}: X ok (x_id={rx.get('id')}), Farcaster fail: "
+                f"{rf.get('error') or rf.get('body') or rf}"
+            )
+        elif fc_ok and not x_ok:
+            print(
+                f"⚠️ Автопост из канала {chat_id}: Farcaster ok (hash={rf.get('hash')}), X fail: "
+                f"{rx.get('error') or rx.get('body') or rx}"
+            )
+        else:
+            print(
+                f"❌ Автопост из канала {chat_id}: X fail: {rx.get('error') or rx.get('body') or rx}; "
+                f"Farcaster fail: {rf.get('error') or rf.get('body') or rf}"
+            )
     
     # Отправляем уведомление в Telegram только после успешного автопостинга
     if AUTOPOST_NOTIFY_CHAT_ID and result.get("ok"):
@@ -1630,6 +2041,20 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"❌ Не удалось отправить уведомление даже в plain text: {e2}")
 
 
+async def _ptb_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ловит необработанные исключения в хендлерах: лог + не даём PTB уронить процесс без следа."""
+    err = context.error
+    if err is None:
+        return
+    try:
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    except Exception:
+        tb = ""
+    print(f"❌ PTB error: {err!s}")
+    if tb:
+        print(tb)
+
+
 async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Диагностический handler: логирует любой входящий message/channel_post.
@@ -1653,8 +2078,31 @@ async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"🧪 DEBUG error: {e}")
 
 
+async def _bot_post_init(application: Application) -> None:
+    """Опционально пишет timestamp в файл для внешнего watchdog (раз в 60s)."""
+    path = os.getenv("BOT_HEALTH_FILE", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as hf:
+            hf.write(f"{time.time():.3f}\n")
+    except OSError as e:
+        print(f"⚠️ BOT_HEALTH_FILE {path!r}: {e}")
+
+    async def _heartbeat_loop():
+        while True:
+            try:
+                with open(path, "w", encoding="utf-8") as hf:
+                    hf.write(f"{time.time():.3f}\n")
+            except OSError as e:
+                print(f"⚠️ BOT_HEALTH_FILE {path!r}: {e}")
+            await asyncio.sleep(60)
+
+    asyncio.create_task(_heartbeat_loop())
+
+
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_bot_post_init).build()
     # Важно: посты из каналов должны обрабатываться ТОЛЬКО автопостингом.
     # Поэтому обычный обработчик текста ограничиваем чат-типами (private/group/supergroup),
     # чтобы он НИКОГДА не перехватывал channel_post.
@@ -1680,7 +2128,38 @@ if __name__ == '__main__':
         ai_status = "не настроен"
     print(f"🚀 Бот @Don_Inv запущен")
     print(f"🤖 AI для перевода: {ai_status}")
+    print(
+        f"📝 X: стиль {'faithful (без шаблонных вопросов)' if _X_FAITHFUL else 'legacy'}"
+        f", предпросмотр ссылок: {'выкл (tombstone)' if _X_SUPPRESS_LINK_PREVIEWS else 'вкл'}"
+    )
+    print(
+        f"🔀 EN для соцсетей: {'раздельно X + Farcaster' if _SEPARATE_XF else 'один и тот же текст'}"
+        f" | из канала: X={'on' if _AUTOP_X else 'off'} Farcaster={'on' if _AUTOP_FC else 'off'}"
+    )
+    if USE_GROK_FOR_X and client_grok:
+        print(f"⏱️ Grok HTTP timeout: {GROK_REQUEST_TIMEOUT}s")
+        print(
+            f"🛡️ Grok: до {GROK_HTTP_ATTEMPTS} HTTP-попыток; circuit: {GROK_CIRCUIT_THRESHOLD} сбоев подряд → пауза {GROK_CIRCUIT_SECONDS}s"
+        )
+    _bot_health = os.getenv("BOT_HEALTH_FILE", "").strip()
+    if _bot_health:
+        print(f"💓 BOT_HEALTH_FILE={_bot_health}")
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
     print(f"🤖 Автопостинг из каналов: {autopost_status}")
-    app.run_polling()
+    if AUTOPOST_ENABLED:
+        print(
+            f"🧵 Автотред: порог {AUTOPOST_THREAD_MIN_BYTES} байт и список; дедуп контента: {AUTOPOST_DEDUPE_HOURS}h"
+        )
+        if AUTOPOST_NOTIFY_CHAT_ID:
+            print(f"📬 Уведомления об автопосте: chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
+        else:
+            print(
+                "📬 Уведомления об автопосте: выкл (нет AUTOPOST_NOTIFY_CHAT_ID или он равен id бота — см. лог при старте)"
+            )
+    app.add_error_handler(_ptb_error_handler)
+    # bootstrap_retries=-1: бесконечные попытки подключиться к Telegram при старте (сеть / DNS).
+    try:
+        app.run_polling(bootstrap_retries=-1)
+    except TypeError:
+        app.run_polling()
