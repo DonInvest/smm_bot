@@ -189,12 +189,52 @@ if _notify_chat_id_str:
     except ValueError:
         AUTOPOST_NOTIFY_CHAT_ID = None
 
+# Частая ошибка: в AUTOPOST_NOTIFY_CHAT_ID кладут число до ":" из TELEGRAM_BOT_TOKEN (id бота).
+# Telegram не даёт боту писать боту → Forbidden, уведомления «пропадают».
+_tg_bot_uid: Optional[int] = None
+if TELEGRAM_TOKEN and ":" in TELEGRAM_TOKEN:
+    try:
+        _tg_bot_uid = int(TELEGRAM_TOKEN.split(":", 1)[0])
+    except ValueError:
+        _tg_bot_uid = None
+if (
+    AUTOPOST_NOTIFY_CHAT_ID is not None
+    and _tg_bot_uid is not None
+    and AUTOPOST_NOTIFY_CHAT_ID == _tg_bot_uid
+):
+    print(
+        "⚠️ AUTOPOST_NOTIFY_CHAT_ID совпадает с id бота из токена: уведомления отключены. "
+        "Укажи свой user id (личка с ботом: /start → в логах DEBUG ... chat_id=...)."
+    )
+    AUTOPOST_NOTIFY_CHAT_ID = None
+
 # Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
 # Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
 PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
 
+# Персона автора для X. Можно переопределить через CREATOR_PERSONA в .env.
+# Этот блок попадает в промпт перевода, чтобы тон не выглядел "переводческим" / AI-generic.
+_DEFAULT_PERSONA = (
+    "PERSONA (you write as):\n"
+    "- CIS-rooted crypto/DeFi pro, in the market since 2017, runs a large RU-speaking Telegram community.\n"
+    "- Confident peer voice. Friendly, slightly degen, light dry humor; never crass, never childish.\n"
+    "- Trader + DeFi specialist: thinks in setups, risks, liquidity, unlocks, TVL, fees, APY.\n"
+    "- Always grounded in facts and numbers. No empty hype. No marketing voice. No news-desk tone.\n"
+    "- Sharp, opinionated takes over neutral summaries. You can advise, but earn it with a fact or a number.\n"
+    "- Reader is crypto-native (traders, builders, alpha hunters). Skip basics, no 101 explainers.\n"
+)
+CREATOR_PERSONA = os.getenv("CREATOR_PERSONA", "").strip() or _DEFAULT_PERSONA
+
 # X: 1 = перевод/тон автора, без «вирусных» вопросов; 0 = старый режим
 _X_FAITHFUL = os.getenv("X_FAITHFUL_X", "1").strip().lower() in ("1", "true", "yes", "on")
+# X-голос: faithful (точный перевод) или reach (упаковка под ленту X: hook-first, URL в конце, ≤1 хештег)
+_X_VOICE = (os.getenv("X_VOICE", "reach").strip().lower() or "reach")
+if _X_VOICE not in ("faithful", "reach"):
+    _X_VOICE = "reach"
+# Включать quote-tweet, если в исходнике найдена ссылка на твит x.com/.../status/...
+_X_AUTO_QUOTE = os.getenv("X_AUTO_QUOTE", "1").strip().lower() in ("1", "true", "yes", "on")
+# Если в посте нет фото, пытаться подобрать лого токена с CoinGecko по $TICKER
+_X_AUTO_LOGO = os.getenv("X_AUTO_LOGO", "1").strip().lower() in ("1", "true", "yes", "on")
 # 1 = скрыть предпросмотр ссылок (tombstone); 0 = обычные ссылки
 _X_SUPPRESS_LINK_PREVIEWS = os.getenv("X_SUPPRESS_LINK_PREVIEWS", "0").strip().lower() in (
     "1",
@@ -574,37 +614,292 @@ def farcaster_cast_url(cast_hash: Optional[str]) -> Optional[str]:
     return f"https://warpcast.com/~/conversations/{cast_hash}"
 
 
+# =============================================================================
+# Карта известных крипто/инфра проектов: алиасы RU/EN -> @handle + $ticker.
+# Используется в детекторе сущностей: гарантирует @mention/тикер без галлюцинаций.
+# Можно расширять через PROJECT_ALIAS_HINTS в .env (тот же формат).
+# =============================================================================
+KNOWN_PROJECTS: List[dict] = [
+    # L1 / L2 / chains
+    {"name": "ethereum", "handle": "@ethereum", "ticker": "$ETH", "aliases": ["ethereum", "эфир", "эфириум", "eth"]},
+    {"name": "solana", "handle": "@solana", "ticker": "$SOL", "aliases": ["solana", "солана", "sol"]},
+    {"name": "bitcoin", "handle": "@Bitcoin", "ticker": "$BTC", "aliases": ["bitcoin", "биткоин", "биток", "btc"]},
+    {"name": "base", "handle": "@base", "ticker": "", "aliases": ["base chain", "base l2", "base network"]},
+    {"name": "arbitrum", "handle": "@arbitrum", "ticker": "$ARB", "aliases": ["arbitrum", "арбитрум", "arb"]},
+    {"name": "optimism", "handle": "@Optimism", "ticker": "$OP", "aliases": ["optimism", "оптимизм", "op mainnet"]},
+    {"name": "polygon", "handle": "@0xPolygon", "ticker": "$POL", "aliases": ["polygon", "полигон", "pol", "matic"]},
+    {"name": "avalanche", "handle": "@avax", "ticker": "$AVAX", "aliases": ["avalanche", "аваланч", "avax"]},
+    {"name": "bnbchain", "handle": "@BNBCHAIN", "ticker": "$BNB", "aliases": ["bnb chain", "bsc", "bnb"]},
+    {"name": "sui", "handle": "@SuiNetwork", "ticker": "$SUI", "aliases": ["sui network", "sui"]},
+    {"name": "aptos", "handle": "@Aptos_Network", "ticker": "$APT", "aliases": ["aptos", "апт"]},
+    {"name": "starknet", "handle": "@Starknet", "ticker": "$STRK", "aliases": ["starknet", "стракнет", "strk"]},
+    {"name": "zksync", "handle": "@zksync", "ticker": "$ZK", "aliases": ["zksync", "зк син"]},
+    {"name": "linea", "handle": "@LineaBuild", "ticker": "$LINEA", "aliases": ["linea"]},
+    {"name": "scroll", "handle": "@Scroll_ZKP", "ticker": "$SCR", "aliases": ["scroll", "скролл"]},
+    {"name": "mantle", "handle": "@0xMantle", "ticker": "$MNT", "aliases": ["mantle", "мантл"]},
+    {"name": "megaeth", "handle": "@megaeth_labs", "ticker": "$MEGA", "aliases": ["megaeth", "мегаeth", "мега eth"]},
+    {"name": "monad", "handle": "@monad_xyz", "ticker": "$MON", "aliases": ["monad", "монад"]},
+    {"name": "berachain", "handle": "@berachain", "ticker": "$BERA", "aliases": ["berachain", "бера", "bera"]},
+    {"name": "celestia", "handle": "@CelestiaOrg", "ticker": "$TIA", "aliases": ["celestia", "целестия", "tia"]},
+    # DeFi
+    {"name": "aave", "handle": "@aave", "ticker": "$AAVE", "aliases": ["aave", "ааве"]},
+    {"name": "lido", "handle": "@LidoFinance", "ticker": "$LDO", "aliases": ["lido", "лидо", "ldo"]},
+    {"name": "uniswap", "handle": "@Uniswap", "ticker": "$UNI", "aliases": ["uniswap", "юнисвап", "uni"]},
+    {"name": "curve", "handle": "@CurveFinance", "ticker": "$CRV", "aliases": ["curve finance", "curve", "crv"]},
+    {"name": "compound", "handle": "@compoundfinance", "ticker": "$COMP", "aliases": ["compound finance", "compound"]},
+    {"name": "pendle", "handle": "@pendle_fi", "ticker": "$PENDLE", "aliases": ["pendle", "пендл"]},
+    {"name": "ethena", "handle": "@ethena_labs", "ticker": "$ENA", "aliases": ["ethena", "этена"]},
+    {"name": "eigenlayer", "handle": "@eigenlayer", "ticker": "$EIGEN", "aliases": ["eigenlayer", "айгенлеер", "eigen"]},
+    {"name": "jito", "handle": "@jito_sol", "ticker": "$JTO", "aliases": ["jito", "джито", "jto"]},
+    {"name": "jupiter", "handle": "@JupiterExchange", "ticker": "$JUP", "aliases": ["jupiter exchange", "jupiter dex", "jup"]},
+    {"name": "gmx", "handle": "@GMX_IO", "ticker": "$GMX", "aliases": ["gmx"]},
+    {"name": "dydx", "handle": "@dYdX", "ticker": "$DYDX", "aliases": ["dydx", "dydx exchange"]},
+    {"name": "sky", "handle": "@SkyEcosystem", "ticker": "$SKY", "aliases": ["sky protocol", "makerdao", "maker dao"]},
+    # CEX / wallets
+    {"name": "binance", "handle": "@binance", "ticker": "", "aliases": ["binance", "бинанс"]},
+    {"name": "bybit", "handle": "@Bybit_Official", "ticker": "", "aliases": ["bybit", "байбит"]},
+    {"name": "coinbase", "handle": "@coinbase", "ticker": "$COIN", "aliases": ["coinbase", "коинбейс"]},
+    {"name": "kraken", "handle": "@krakenfx", "ticker": "", "aliases": ["kraken", "кракен"]},
+    {"name": "okx", "handle": "@okx", "ticker": "$OKB", "aliases": ["okx", "окекс"]},
+    {"name": "metamask", "handle": "@MetaMask", "ticker": "", "aliases": ["metamask", "метамаск"]},
+    {"name": "phantom", "handle": "@phantom", "ticker": "", "aliases": ["phantom wallet", "фантом кошел"]},
+    {"name": "backpack", "handle": "@backpack", "ticker": "", "aliases": ["backpack", "бэкпак"]},
+    # Memecoins / apps
+    {"name": "pumpfun", "handle": "@pumpdotfun", "ticker": "$PUMP", "aliases": ["pumpfun", "pump.fun", "пампфан"]},
+    {"name": "doge", "handle": "@dogecoin", "ticker": "$DOGE", "aliases": ["dogecoin", "догекоин", "doge"]},
+    {"name": "shib", "handle": "@Shibtoken", "ticker": "$SHIB", "aliases": ["shiba inu", "shibtoken", "shib"]},
+    {"name": "pepe", "handle": "", "ticker": "$PEPE", "aliases": ["pepecoin", "$pepe"]},
+    # Infrastructure
+    {"name": "chainlink", "handle": "@chainlink", "ticker": "$LINK", "aliases": ["chainlink", "чейнлинк", "link token"]},
+    {"name": "thegraph", "handle": "@graphprotocol", "ticker": "$GRT", "aliases": ["the graph", "graph protocol", "grt"]},
+    {"name": "filecoin", "handle": "@Filecoin", "ticker": "$FIL", "aliases": ["filecoin", "филкоин"]},
+    {"name": "render", "handle": "@rendernetwork", "ticker": "$RENDER", "aliases": ["render network", "render token"]},
+    # Stables
+    {"name": "usdc", "handle": "@circle", "ticker": "$USDC", "aliases": ["usdc", "юсдс"]},
+    {"name": "usdt", "handle": "@Tether_to", "ticker": "$USDT", "aliases": ["tether", "usdt", "юсдт"]},
+    # NFT
+    {"name": "opensea", "handle": "@opensea", "ticker": "", "aliases": ["opensea", "опенси"]},
+    {"name": "magiceden", "handle": "@MagicEden", "ticker": "", "aliases": ["magic eden", "magiceden"]},
+    # AI majors
+    {"name": "openai", "handle": "@OpenAI", "ticker": "", "aliases": ["openai", "опенаи", "chatgpt"]},
+    {"name": "anthropic", "handle": "@AnthropicAI", "ticker": "", "aliases": ["anthropic", "claude ai"]},
+]
+# Кэш скомпилированных regex для алиасов (ускоряем)
+_KNOWN_PROJECTS_PATTERNS: List[Tuple[dict, "re.Pattern"]] = []
+for _p in KNOWN_PROJECTS:
+    _alias_re = "|".join(re.escape(a) for a in _p["aliases"] if a)
+    if not _alias_re:
+        continue
+    _KNOWN_PROJECTS_PATTERNS.append((_p, re.compile(r"(?<![\w$@])(?:" + _alias_re + r")(?![\w])", re.IGNORECASE)))
+
+
+def detect_known_projects(text: str) -> List[dict]:
+    """Возвращает список совпавших проектов в порядке появления в тексте. Без дублей."""
+    if not text:
+        return []
+    seen = set()
+    out: List[dict] = []
+    src = text or ""
+    for proj, pat in _KNOWN_PROJECTS_PATTERNS:
+        if proj["name"] in seen:
+            continue
+        if pat.search(src):
+            out.append(proj)
+            seen.add(proj["name"])
+    return out
+
+
+def detect_tickers_in_source(text: str) -> set:
+    """Тикеры вида $ABC, которые УЖЕ есть в исходном тексте (для строгой валидации)."""
+    if not text:
+        return set()
+    return {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", text)}
+
+
 def _build_project_entity_hints(source_text: str) -> str:
     """
-    Собирает подсказки для модели по @/$ из PROJECT_ALIAS_HINTS на основе текста поста.
+    Собирает подсказки для модели по @/$ на основе:
+    1) встроенного KNOWN_PROJECTS (детектор по алиасам RU/EN)
+    2) PROJECT_ALIAS_HINTS из .env (расширение)
     Возвращает блок строк для промпта.
     """
-    if not PROJECT_ALIAS_HINTS or not source_text:
+    if not source_text:
         return ""
-    src = source_text.lower()
-    # Разрешаем тикер только если он уже явно присутствует в исходнике ($ABC)
-    source_tickers = {m.group(0).upper() for m in re.finditer(r"\$[A-Za-z0-9_]{2,15}", source_text)}
-    lines = []
-    for item in PROJECT_ALIAS_HINTS.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-        # key:@handle:$TICKER (ticker опционален)
-        parts = [p.strip() for p in item.split(":") if p.strip()]
-        if len(parts) < 2:
-            continue
-        key = parts[0]
-        handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-        ticker = parts[2] if len(parts) > 2 else ""
-        if key.lower() in src:
+    source_tickers = detect_tickers_in_source(source_text)
+    lines: List[str] = []
+    used_handles = set()
+
+    for proj in detect_known_projects(source_text):
+        handle = proj.get("handle") or ""
+        ticker = proj.get("ticker") or ""
+        # Тикер из словаря используем, если: уже есть в исходнике, ИЛИ проект — главная тема.
+        if ticker and ticker.upper() not in source_tickers:
+            # Разрешаем тикер из словаря, если алиас встречается ≥1 раза (то есть проект явно упомянут).
+            pass  # ticker остаётся, модель будет инструктирована «если уместно»
+        if handle:
+            if handle in used_handles:
+                continue
+            used_handles.add(handle)
+        suffix = f" {ticker}" if ticker else ""
+        lines.append(f"- {proj['name']} -> {handle}{suffix}".rstrip())
+
+    # Расширение из PROJECT_ALIAS_HINTS (тот же синтаксис, что был раньше).
+    if PROJECT_ALIAS_HINTS:
+        src = source_text.lower()
+        for item in PROJECT_ALIAS_HINTS.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            parts = [p.strip() for p in item.split(":") if p.strip()]
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            handle = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+            ticker = parts[2] if len(parts) > 2 else ""
+            if key.lower() not in src:
+                continue
             if ticker and not ticker.startswith("$"):
                 ticker = f"${ticker}"
-            # Тикер в подсказку добавляем только если он есть в исходном тексте.
-            # Это защищает от "выдуманных" тикеров вроде $BKP вместо фактического $BP.
             if ticker and ticker.upper() not in source_tickers:
                 ticker = ""
-            lines.append(f"- {key} -> {handle}" + (f" {ticker}" if ticker else ""))
+            if handle in used_handles:
+                continue
+            used_handles.add(handle)
+            suffix = f" {ticker}" if ticker else ""
+            lines.append(f"- {key} -> {handle}{suffix}".rstrip())
+
     return "\n".join(lines)
+
+
+# =============================================================================
+# Anti-AI QA фильтр: ловим клише и шаблонные хвосты, чтобы лента не видела "AI-feel".
+# =============================================================================
+_AI_CLICHE_PATTERNS = [
+    re.compile(r"\bthoughts\?", re.I),
+    re.compile(r"\blet me know\b", re.I),
+    re.compile(r"\bdrop your\b", re.I),
+    re.compile(r"\bchange my mind\b", re.I),
+    re.compile(r"\bhot take\b", re.I),
+    re.compile(r"\bspill the tea\b", re.I),
+    re.compile(r"\bwhat'?s your take\b", re.I),
+    re.compile(r"\bagree\?\s*$", re.I),
+    re.compile(r"\bLFG{1,}\b", re.I),
+    re.compile(r"\bgm\b", re.I),
+    re.compile(r"\bwagmi\b", re.I),
+    re.compile(r"\bngmi\b", re.I),
+    re.compile(r"\bbullish af\b", re.I),
+    re.compile(r"^\s*Just\b", re.I | re.M),
+    re.compile(r"^\s*Today,?\s+", re.I | re.M),
+    re.compile(r"^\s*Here'?s why\b", re.I | re.M),
+    re.compile(r"^\s*In a world\b", re.I | re.M),
+    re.compile(r"^\s*Let me explain\b", re.I | re.M),
+    re.compile(r"🚀{2,}"),
+    re.compile(r"🔥{3,}"),
+]
+
+
+def qa_check_x_text(text: str) -> List[str]:
+    """Возвращает список найденных нарушений (пусто, если всё ок)."""
+    if not text:
+        return []
+    issues: List[str] = []
+    for pat in _AI_CLICHE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            issues.append(f"banned phrase: {m.group(0)!r}")
+    hashtags = re.findall(r"(?<!\w)#[\w]+", text)
+    if len(hashtags) > 1:
+        issues.append(f"too many hashtags ({len(hashtags)}): {hashtags[:3]}")
+    emojis = re.findall(
+        r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]",
+        text,
+    )
+    if len(emojis) > 2:
+        issues.append(f"too many emojis ({len(emojis)})")
+    return issues
+
+
+# =============================================================================
+# Quote tweet detection: первая ссылка на твит x.com/.../status/<id>
+# =============================================================================
+_X_STATUS_RE = re.compile(
+    r"https?://(?:www\.)?(?:x\.com|twitter\.com|mobile\.twitter\.com)/[^/\s]+/status/(\d{10,30})",
+    re.IGNORECASE,
+)
+
+
+def extract_quote_tweet(source_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Из исходника достаёт (quote_tweet_id, original_url). None, если нет."""
+    if not source_text:
+        return None, None
+    m = _X_STATUS_RE.search(source_text)
+    if not m:
+        return None, None
+    return m.group(1), m.group(0)
+
+
+# =============================================================================
+# CoinGecko: бесплатное лого токена по символу (без ключа). Кэш на диск, TTL 30 дней.
+# =============================================================================
+_COINGECKO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".coingecko_cache.json")
+_COINGECKO_CACHE_TTL = 30 * 24 * 3600
+
+
+def _coingecko_cache_load() -> dict:
+    try:
+        with open(_COINGECKO_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _coingecko_cache_save(data: dict) -> None:
+    try:
+        with open(_COINGECKO_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def get_coingecko_logo_url(ticker: str) -> Optional[str]:
+    """По $ABC возвращает URL логотипа (large), либо None. С кэшем + мягкий таймаут."""
+    if not ticker:
+        return None
+    sym = ticker.lstrip("$").upper()
+    if not sym or len(sym) > 15:
+        return None
+    cache = _coingecko_cache_load()
+    rec = cache.get(sym)
+    if isinstance(rec, dict) and rec.get("ts"):
+        if (time.time() - float(rec["ts"])) < _COINGECKO_CACHE_TTL:
+            url = rec.get("url")
+            return url or None
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": sym},
+            timeout=6,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() or {}
+        for coin in data.get("coins", [])[:8]:
+            csym = str(coin.get("symbol") or "").upper()
+            if csym == sym:
+                url = coin.get("large") or coin.get("small") or coin.get("thumb")
+                if url:
+                    cache[sym] = {"url": url, "ts": time.time()}
+                    _coingecko_cache_save(cache)
+                    return url
+        # Нет точного матча — пишем "пусто", чтобы не дёргать API повторно.
+        cache[sym] = {"url": "", "ts": time.time()}
+        _coingecko_cache_save(cache)
+        return None
+    except requests.RequestException:
+        return None
+    except Exception:
+        return None
 
 
 def upload_media_to_x(
@@ -638,19 +933,28 @@ def upload_media_to_x(
         return {"ok": False, "error": str(e)}
 
 
-def post_to_x(text: str, media_ids: Optional[List[str]] = None, reply_to_tweet_id: Optional[str] = None) -> dict:
+def post_to_x(
+    text: str,
+    media_ids: Optional[List[str]] = None,
+    reply_to_tweet_id: Optional[str] = None,
+    quote_tweet_id: Optional[str] = None,
+) -> dict:
     """
     Публикуем пост в X API v2.
     Всегда используем OAuth2 (Bearer) для твита — так не будет 401 при истёкших OAuth1.
     Фото загружаются отдельно через upload_media_to_x (OAuth1), сюда передаются уже media_ids.
     card_uri: "tombstone://card" опционально (X_SUPPRESS_LINK_PREVIEWS=1) отключает предпросмотр ссылок.
     reply_to_tweet_id: ID твита для ответа (создание треда).
+    quote_tweet_id: ID цитируемого твита (native quote — лучше внешней ссылки в ленте X).
     """
     url = "https://api.x.com/2/tweets"
-    clean = clamp_to_limits(text)
+    # Для X применяем только лимит X (а не общий X+Farcaster), иначе текст режется слишком агрессивно.
+    clean = clamp_to_x_text(text)
     payload: dict = {"text": clean}
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
+    if quote_tweet_id:
+        payload["quote_tweet_id"] = str(quote_tweet_id)
     # Предпросмотр ссылок: отключаем только если X_SUPPRESS_LINK_PREVIEWS=1 (tombstone)
     # Важно: X API запрещает передавать одновременно media и card_uri (ошибка 400).
     if _X_SUPPRESS_LINK_PREVIEWS and (not media_ids) and _URL_RE.search(clean):
@@ -728,7 +1032,8 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None, reply_to_ha
         "x-api-key": NEYNAR_API_KEY,
         "Content-Type": "application/json",
     }
-    clean = clamp_to_limits(text)
+    # Для Farcaster применяем только лимит Farcaster (байты UTF-8).
+    clean = clamp_to_farcaster_text(text)
     payload = {"signer_uuid": NEYNAR_SIGNER_UUID, "text": clean}
     # Добавляем в embeds только изображения (не ссылки), чтобы ссылки были без предпросмотра
     if embeds:
@@ -1318,23 +1623,39 @@ SOURCE:
         print("⚠️ Fact-sheet шаг Grok не удался, fallback на single-pass rewrite")
         fact_sheet_raw = "{}"
 
-    if _X_FAITHFUL:
-        prompt = f"""
-You are Grok. Translate the SOURCE from Russian into natural English for X (Twitter).
+    voice = _X_VOICE
+    voice_block = (
+        "VOICE = reach: optimize for X feed.\n"
+        "- The FIRST line is a strong hook: a concrete claim, number, or news. No throat-clearing.\n"
+        "- No engagement bait, no AI clichés (no 'thoughts?', 'let me know', 'hot take', 'spill the tea', 'gm', 'wagmi', 'LFG', 'just', 'today,', 'here's why', 'in a world').\n"
+        "- Max 1 emoji total. Max 1 hashtag total, only if it adds discovery (e.g. #DeFi, #L2, #AI). Hashtags are optional.\n"
+        "- If a URL exists, put it on the LAST line, on its own line. Single space before, no markdown.\n"
+        "- Tone is a sharp crypto/tech native voice, not a marketing pitch.\n"
+        if voice == "reach"
+        else "VOICE = faithful: stay close to author's tone and structure; no growth-hack rewrite.\n"
+        "- Do NOT add a question at the end unless the Russian source already asks one.\n"
+        "- Do NOT add engagement filler ('thoughts?', 'let me know', 'hot take', 'spill the tea', 'gm', 'wagmi', 'LFG').\n"
+        "- Do NOT add hashtags unless the source already has them.\n"
+    )
+    prompt = f"""
+You are writing on X (Twitter) AS THE AUTHOR below. Translate the Russian SOURCE into natural English IN THIS VOICE.
+
+{CREATOR_PERSONA}
 
 NON-NEGOTIABLE:
-- Faithful to meaning and tone. Not a "growth hack" rewrite. No fake enthusiasm layered on top.
-- Include EVERY http(s) URL that appears in the SOURCE (same string). Keep "text (https://...)" format when the source has it.
+- Faithful to facts and numbers; do not invent.
+- Include EVERY http(s) URL that appears in the SOURCE.
 - No markdown. Strip ** _ ` if the source had markdown-like noise.
-- Do NOT add a question at the end unless the Russian source is already asking the reader something in that part.
-- Do NOT add engagement filler: no "spill the tea", "hot take", "let me know", "thoughts?", "change my mind", "what's your take", "drop your" unless those ideas are in the source.
-- Do NOT add hashtags unless the source already has them.
-- @mention and $TICKER only if present in the source. PROJECT HINTS may disambiguate handles; never invent tickers.
-- If the source is a list of news bullets, you may keep short bullets, but do not turn each into a separate marketing pitch.
 - Max output: X effective length <= {X_MAX_CHARS} (URL counts as {X_TCO_URL_LEN} each), Farcaster UTF-8 <= {FARCASTER_MAX_BYTES} bytes.
 
-PROJECT/TICKER HINTS (ticker only if present in source):
+ENTITIES (USE THESE HANDLES whenever the project is mentioned, even if the source uses only the name):
 {entity_hints if entity_hints else "- (none)"}
+
+TICKER RULES:
+- Use $TICKER from ENTITIES only when the project is the subject of that line (not generic mention).
+- Never invent a ticker that isn't in ENTITIES and isn't in the SOURCE.
+
+{voice_block}
 
 FACT SHEET (ground truth; do not add new facts):
 {fact_sheet_raw}
@@ -1342,61 +1663,56 @@ FACT SHEET (ground truth; do not add new facts):
 SOURCE:
 {text}
 
-OUTPUT: Only the English post text, nothing else.
-""".strip()
-    else:
-        prompt = f"""
-You are Grok, expert at X (Twitter) posts. Translate from Russian to English; stay factual; avoid generic "AI post" feel.
-
-Rules:
-- Preserve ALL URLs exactly (including "label (https://...)" and bare https links).
-- Remove markdown (** _ `). Keep bullets/line breaks if useful.
-- You MAY end with a sharp line or a real open question, but do NOT use cliché engagement questions (no "spill the tea", "thoughts?", "agree?").
-- @mention / $TICKER only if in the source. Project hints: {entity_hints if entity_hints else "- (none)"}
-- Hashtags: at most 1-2, only if they fit; not required.
-- Max: X effective <= {X_MAX_CHARS} (URL ~{X_TCO_URL_LEN} each), Farcaster <= {FARCASTER_MAX_BYTES} bytes.
-
-FACT SHEET (ground truth):
-{fact_sheet_raw}
-
-SOURCE:
-{text}
-
-OUTPUT: Only the English post, no commentary.
+OUTPUT: Only the English post text, nothing else. No code fences. No commentary.
 """.strip()
     
     try:
-        grok_temp = 0.45 if _X_FAITHFUL else 0.75
-        raw_translated = _grok_request(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You write clear English. You are not a customer-support bot. No engagement bait. "
-                        "Respect the source."
-                        if _X_FAITHFUL
-                        else "You write like a sharp crypto/tech X account: concise, specific, not formulaic."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=grok_temp,
+        grok_temp = 0.45 if voice == "faithful" else 0.6
+        system_msg = (
+            "You write clear, native-sounding English for X (Twitter). "
+            "No engagement bait, no AI clichés. Respect source facts."
+            if voice == "faithful"
+            else "You write like a sharp crypto/tech X account: concise, hook-first, factual, not formulaic."
         )
-        if raw_translated:
-            translated = normalize_social_text(raw_translated)
-            translated = ensure_urls_preserved(text, translated)
-            translated = _avoid_cutting_url(translated)
-            
-            if not translated:
-                return None
-            
-            if not fits_limits(translated):
-                translated = clamp_to_limits(translated)
-            
-            final = clamp_to_limits(translated)
-            print(f"✅ Grok: переведено и оптимизировано ({len(final)} chars)")
-            return final
-        return None
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
+        raw_translated = _grok_request(messages, temperature=grok_temp)
+        if not raw_translated:
+            return None
+
+        # QA pass: один авто-ретрай, если поймали клише/много хештегов.
+        issues = qa_check_x_text(raw_translated)
+        if issues:
+            print(f"⚠️ QA X v1 issues: {issues}; запрашиваю чистую версию...")
+            retry_user = prompt + (
+                "\n\nIMPORTANT: previous version had these issues: "
+                + "; ".join(issues[:5])
+                + ". Rewrite to remove ALL of them while keeping facts, URLs, handles, tickers."
+            )
+            raw_retry = _grok_request(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": retry_user},
+                ],
+                temperature=max(0.2, grok_temp - 0.15),
+            )
+            if raw_retry and not qa_check_x_text(raw_retry):
+                raw_translated = raw_retry
+            elif raw_retry:
+                raw_translated = raw_retry  # лучше частично чистая, чем падать
+
+        translated = normalize_social_text(raw_translated)
+        translated = ensure_urls_preserved(text, translated)
+        translated = _avoid_cutting_url(translated)
+        if not translated:
+            return None
+        if not fits_limits(translated):
+            translated = clamp_to_limits(translated)
+        final = clamp_to_limits(translated)
+        print(f"✅ Grok: переведено и оптимизировано ({len(final)} chars, voice={voice})")
+        return final
     except Exception as e:
         print(f"Grok translation error: {e}")
         return None
@@ -1524,44 +1840,77 @@ def _translate_dual_grok_block(source: str) -> Optional[Tuple[str, str]]:
         _grok_log_circuit_block()
         return None
     hints = _build_project_entity_hints(source)
-    hint_block = f"PROJECT HINTS (ticker only if in source):\n{hints}\n" if hints else ""
-    faithful = _X_FAITHFUL
-    x_line = (
-        "Twitter: max X effective length {0} (URL ≈{1} chars). Faithful; no engagement-bait; preserve URLs; no # unless in source."
-    ).format(X_MAX_CHARS, X_TCO_URL_LEN)
-    if not faithful:
-        x_line = "Twitter: strong hook, same facts, max {0} effective, preserve URLs".format(X_MAX_CHARS)
+    hint_block = (
+        "ENTITIES (USE THESE HANDLES whenever the project is mentioned, even if the source uses only the name):\n"
+        + hints
+        + "\nTICKER RULES: use $TICKER from ENTITIES only when the project is the subject of that line.\n"
+        if hints
+        else ""
+    )
+    voice = _X_VOICE
+
+    if voice == "reach":
+        x_line = (
+            f"Twitter: hook-first (FIRST LINE = concrete claim/number/news). Max X-effective {X_MAX_CHARS} (URL≈{X_TCO_URL_LEN}). "
+            f"≤1 emoji, ≤1 hashtag (only if it aids discovery). If a URL is present, place it on the LAST line, alone. "
+            f"No markdown. No engagement bait. No 'thoughts?', 'let me know', 'gm', 'wagmi', 'LFG', 'just', 'today,', 'here's why', 'in a world'."
+        )
+    else:
+        x_line = (
+            f"Twitter: max X-effective {X_MAX_CHARS} (URL≈{X_TCO_URL_LEN}). Faithful to author's tone. "
+            f"No engagement bait; no # unless in source; preserve all URLs."
+        )
     fc_line = (
-        "Farcaster: same core facts, tighter crypto/builder voice, no hashtag spam, "
-        "max {0} UTF-8 bytes, preserve URLs, no 'thoughts?' style filler"
-    ).format(FARCASTER_MAX_BYTES)
-    prompt = f"""Translate the Russian SOURCE into English for two outputs. Reply with ONLY a JSON object (no ``` fence):
+        f"Farcaster: same facts, builder/crypto voice, ≤{FARCASTER_MAX_BYTES} UTF-8 bytes, preserve URLs, no clichés."
+    )
+    prompt = f"""You are writing AS THE AUTHOR below. Translate the Russian SOURCE into English for two outputs. Reply with ONLY a JSON object (no ``` fence):
 {{"x": "<string>", "farcaster": "<string>"}}
+
+{CREATOR_PERSONA}
 
 {hint_block}
 For "x": {x_line}
 For "farcaster": {fc_line}
-Rules for both: translate faithfully; all http(s) from source must appear; @ / $ only if in source; no markdown; no new facts.
+Rules for both: stay in the author's voice; translate faithfully; all http(s) from SOURCE must appear in BOTH outputs; @ from ENTITIES whenever the project is mentioned; $ ticker from ENTITIES only when the project is the subject; no markdown; no new facts.
 
 SOURCE:
 {source}
 """.strip()
-    raw = _grok_request(
-        [
-            {
-                "role": "system",
-                "content": "Output a single JSON object with keys x and farcaster. Strings in double quotes. No markdown, no other keys.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4 if faithful else 0.65,
-    )
+
+    def _ask(extra: str = "") -> Optional[str]:
+        return _grok_request(
+            [
+                {
+                    "role": "system",
+                    "content": "Output a single JSON object with keys x and farcaster. Strings in double quotes. No markdown, no other keys.",
+                },
+                {"role": "user", "content": prompt + (("\n\n" + extra) if extra else "")},
+            ],
+            temperature=0.4 if voice == "faithful" else 0.6,
+        )
+
+    raw = _ask()
     if not raw:
         return None
     pr = _parse_dual_json_raw(raw)
     if not pr:
         print("⚠️ Grok dual: не распарсили JSON")
         return None
+
+    issues = qa_check_x_text(pr[0])
+    if issues:
+        print(f"⚠️ QA X (dual) issues: {issues}; запрашиваю чистую версию...")
+        retry = _ask(
+            "IMPORTANT: previous 'x' had these issues: "
+            + "; ".join(issues[:5])
+            + ". Rewrite the 'x' field to remove ALL of them while keeping facts, URLs, handles, tickers. Keep 'farcaster' equally clean."
+        )
+        if retry:
+            pr2 = _parse_dual_json_raw(retry)
+            if pr2 and not qa_check_x_text(pr2[0]):
+                pr = pr2
+            elif pr2:
+                pr = pr2
     return _finalize_dual_texts(source, pr[0], pr[1])
 
 
@@ -1569,12 +1918,28 @@ def _translate_dual_gemini_block(source: str) -> Optional[Tuple[str, str]]:
     if not client_ai or not MODEL_NAME:
         return None
     h = _build_project_entity_hints(source)
-    hint_block = f"\nHINTS:\n{h}\n" if h else ""
+    hint_block = (
+        "\nENTITIES (USE THESE HANDLES whenever the project is mentioned; $TICKER only when project is subject):\n"
+        + h
+        + "\n"
+        if h
+        else ""
+    )
+    voice = _X_VOICE
+    x_line = (
+        f"Field \"x\": hook-first (FIRST LINE = concrete claim/number/news), max {X_MAX_CHARS} X-effective (URL≈{X_TCO_URL_LEN}); ≤1 emoji; ≤1 hashtag; URL on LAST line alone; no engagement bait."
+        if voice == "reach"
+        else f"Field \"x\": faithful to source, max {X_MAX_CHARS} X-effective (URL≈{X_TCO_URL_LEN}); no engagement bait; no # unless in source."
+    )
     prompt = f"""Output ONLY this JSON, no other text, no ```:
 {{"x": "<string>", "farcaster": "<string>"}}
-Translate Russian SOURCE to English.
-Field "x": for Twitter, max {X_MAX_CHARS} effective (URL as {X_TCO_URL_LEN} each). Be faithful; do not add hashtag spam. Preserve all URLs.
-Field "farcaster": for Farcaster cast, max {FARCASTER_MAX_BYTES} UTF-8 bytes, shorter, builder/crypto tone, fewer hashtags, preserve URLs.
+You are writing AS THE AUTHOR below. Translate Russian SOURCE to English in this voice.
+
+{CREATOR_PERSONA}
+
+{x_line}
+Field "farcaster": max {FARCASTER_MAX_BYTES} UTF-8 bytes, builder/crypto tone, preserve URLs, no clichés.
+Both fields must preserve all http(s) URLs from SOURCE. Stay in the author's voice.
 {hint_block}SOURCE:
 {source}""".strip()
     try:
@@ -1641,6 +2006,78 @@ async def _translate_section(text: str, for_x: bool = True) -> Optional[str]:
     return None
 
 
+def _download_and_upload_image_to_x(image_url: str) -> Optional[str]:
+    """Скачивает картинку по URL и загружает в X (OAuth1). Возвращает media_id или None."""
+    if not image_url:
+        return None
+    if not (X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET):
+        return None
+    tmp_path: Optional[str] = None
+    try:
+        resp = requests.get(image_url, timeout=10, stream=True)
+        if resp.status_code != 200:
+            return None
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "image" not in ctype:
+            return None
+        ext = ".jpg"
+        if "png" in ctype:
+            ext = ".png"
+        elif "webp" in ctype:
+            ext = ".webp"
+        elif "gif" in ctype:
+            ext = ".gif"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp_path = tmp.name
+            total = 0
+            for chunk in resp.iter_content(8192):
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                total += len(chunk)
+                if total > 5_000_000:  # >5MB — слишком много, X любит компактные
+                    break
+        up = upload_media_to_x(tmp_path)
+        if up.get("ok"):
+            return up.get("media_id")
+        return None
+    except requests.RequestException:
+        return None
+    except Exception:
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _apply_quote_strategy(source: str, x_text: str) -> Tuple[str, Optional[str]]:
+    """Если в исходнике есть ссылка на твит, возвращает (x_text без этой ссылки, quote_tweet_id)."""
+    if not _X_AUTO_QUOTE or not source or not x_text:
+        return x_text, None
+    qid, _ = extract_quote_tweet(source)
+    if not qid:
+        return x_text, None
+    cleaned = _X_STATUS_RE.sub("", x_text, count=1)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), qid
+
+
+def _pick_ticker_for_logo(*texts: str) -> Optional[str]:
+    """Берём первый $TICKER (2..15 букв/цифр) из любых переданных текстов."""
+    for t in texts:
+        if not t:
+            continue
+        m = re.search(r"\$([A-Za-z][A-Za-z0-9_]{1,14})\b", t)
+        if m:
+            return m.group(1).upper()
+    return None
+
+
 async def _post_single_section(
     text: str,
     photo_file_id: Optional[str] = None,
@@ -1658,14 +2095,40 @@ async def _post_single_section(
         if photo_file_id and bot:
             media_ids, farcaster_embeds, _ = await process_and_upload_photo(photo_file_id, bot)
         load_dotenv(_load_env_path, override=True)
-        if do_x and tx and tx.strip():
-            result_x = post_to_x(tx, media_ids=media_ids)
+
+        quote_id: Optional[str] = None
+        x_text_to_post = tx or ""
+
+        if do_x and x_text_to_post.strip():
+            # 1) Quote-tweet: если в исходнике найдена ссылка на твит → native quote вместо внешней ссылки.
+            x_text_to_post, quote_id = _apply_quote_strategy(text, x_text_to_post)
+            if quote_id:
+                print(f"💬 Quote-tweet: использую исходный твит {quote_id}")
+
+            # 2) Авто-лого CoinGecko по $TICKER, если в посте нет своего фото.
+            if not media_ids and _X_AUTO_LOGO:
+                ticker = _pick_ticker_for_logo(x_text_to_post, text)
+                if ticker:
+                    logo_url = get_coingecko_logo_url(ticker)
+                    if logo_url:
+                        mid = _download_and_upload_image_to_x(logo_url)
+                        if mid:
+                            media_ids = [mid]
+                            print(f"🧩 Авто-лого CoinGecko ${ticker}: добавлено в X media")
+
+            result_x = post_to_x(
+                x_text_to_post,
+                media_ids=media_ids,
+                quote_tweet_id=quote_id,
+            )
         else:
             result_x = {"ok": True, "skipped": True, "id": None}
+
         if do_fc and tfc and tfc.strip():
             result_fc = post_to_farcaster(tfc, embeds=farcaster_embeds)
         else:
             result_fc = {"ok": True, "skipped": True, "hash": None}
+
         published = bool(
             (result_x.get("ok") and result_x.get("id"))
             or (result_fc.get("ok") and result_fc.get("hash"))
@@ -1674,7 +2137,7 @@ async def _post_single_section(
             "ok": published,
             "x": result_x,
             "farcaster": result_fc,
-            "text": tx,
+            "text": x_text_to_post or tx,
             "text_farcaster": tfc,
         }
     except Exception as e:
@@ -1835,12 +2298,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Сохраняем связь channel message -> social ids для последующего delete/repost
     if result.get("ok"):
         x_ids, fc_hashes = _extract_social_ids(result)
+        # Сохраняем "hook" (первую строку X-текста) для будущей аналитики «что лучше залетает».
+        _hook_src = (result.get("text") or "").strip()
+        _hook = (_hook_src.split("\n", 1)[0] if _hook_src else "")[:200]
         state[state_key] = {
             "chat_id": chat_id,
             "message_id": message_id,
             "posted_at": int(time.time()),
             "x_ids": x_ids,
             "fc_hashes": fc_hashes,
+            "hook": _hook,
+            "voice": _X_VOICE,
         }
         if AUTOPOST_DEDUPE_HOURS > 0:
             dmap = state.get("_dedupe")
@@ -1858,6 +2326,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         posts_count = result.get("posts_count", 0)
         x_info = result.get("x", {})
         fc_info = result.get("farcaster", {})
+        x_replies = x_info.get("replies") or []
+        fc_replies = fc_info.get("replies") or []
+
+        def _first_reply_err(replies):
+            for rr in replies:
+                if rr.get("ok"):
+                    continue
+                e = rr.get("error") or rr.get("body")
+                if e:
+                    return str(e)
+            return None
         
         lines = [f"🧵 Тред из {posts_count} постов:"]
         
@@ -1865,15 +2344,25 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         x_total = x_info.get("total", 0)
         if x_success > 0:
             lines.append(f"✅ X: {x_success}/{x_total} постов опубликовано")
+            if x_success < x_total:
+                x_err = _first_reply_err(x_replies)
+                lines.append(f"⚠️ X: часть постов не вышла ({x_total - x_success} шт){': ' + x_err if x_err else ''}")
         else:
-            lines.append(f"❌ X: не удалось опубликовать")
+            x_err = _first_reply_err(x_replies)
+            lines.append(f"❌ X: не удалось опубликовать{': ' + x_err if x_err else ''}")
         
         fc_success = fc_info.get("success", 0)
         fc_total = fc_info.get("total", 0)
         if fc_success > 0:
             lines.append(f"✅ Farcaster: {fc_success}/{fc_total} постов опубликовано")
+            if fc_success < fc_total:
+                fc_err = _first_reply_err(fc_replies)
+                lines.append(
+                    f"⚠️ Farcaster: часть постов не вышла ({fc_total - fc_success} шт){': ' + fc_err if fc_err else ''}"
+                )
         else:
-            lines.append(f"❌ Farcaster: не удалось опубликовать")
+            fc_err = _first_reply_err(fc_replies)
+            lines.append(f"❌ Farcaster: не удалось опубликовать{': ' + fc_err if fc_err else ''}")
     else:
         # Обычный пост
         result_x = result.get("x", {})
@@ -1927,11 +2416,50 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     result_msg = "\n".join(notify_lines)
     
-    # Логируем в консоль
-    if result.get("ok"):
-        print(f"✅ Автопост из канала {chat_id}: опубликовано в X/Farcaster")
+    # Логируем в консоль раздельно по платформам (для треда структура x/fc — success/total/replies, не ok/id)
+    rx = result.get("x") or {}
+    rf = result.get("farcaster") or {}
+    if result.get("thread"):
+        xs, xt = int(rx.get("success") or 0), int(rx.get("total") or 0)
+        fs, ft = int(rf.get("success") or 0), int(rf.get("total") or 0)
+        x_replies = rx.get("replies") or []
+        fc_replies = rf.get("replies") or []
+        first_x = next((r.get("id") for r in x_replies if r.get("ok") and r.get("id")), None)
+        first_fc = next((r.get("hash") for r in fc_replies if r.get("ok") and r.get("hash")), None)
+        x_full = xt > 0 and xs >= xt
+        fc_full = ft > 0 and fs >= ft
+        if x_full and fc_full:
+            print(
+                f"✅ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft} "
+                f"(корень x={first_x} fc={first_fc})"
+            )
+        elif xs > 0 or fs > 0:
+            print(
+                f"⚠️ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft} "
+                f"(корень x={first_x} fc={first_fc})"
+            )
+        else:
+            print(f"❌ Автопост (тред) из канала {chat_id}: X {xs}/{xt}, Farcaster {fs}/{ft}")
     else:
-        print(f"❌ Автопост из канала {chat_id}: ошибка - {result.get('error', result)}")
+        x_ok = bool(rx.get("ok") and rx.get("id"))
+        fc_ok = bool(rf.get("ok") and rf.get("hash"))
+        if x_ok and fc_ok:
+            print(f"✅ Автопост из канала {chat_id}: X+Farcaster ok (x_id={rx.get('id')} fc_hash={rf.get('hash')})")
+        elif x_ok and not fc_ok:
+            print(
+                f"⚠️ Автопост из канала {chat_id}: X ok (x_id={rx.get('id')}), Farcaster fail: "
+                f"{rf.get('error') or rf.get('body') or rf}"
+            )
+        elif fc_ok and not x_ok:
+            print(
+                f"⚠️ Автопост из канала {chat_id}: Farcaster ok (hash={rf.get('hash')}), X fail: "
+                f"{rx.get('error') or rx.get('body') or rx}"
+            )
+        else:
+            print(
+                f"❌ Автопост из канала {chat_id}: X fail: {rx.get('error') or rx.get('body') or rx}; "
+                f"Farcaster fail: {rf.get('error') or rf.get('body') or rf}"
+            )
     
     # Отправляем уведомление в Telegram только после успешного автопостинга
     if AUTOPOST_NOTIFY_CHAT_ID and result.get("ok"):
@@ -2048,7 +2576,7 @@ if __name__ == '__main__':
     print(f"🚀 Бот @Don_Inv запущен")
     print(f"🤖 AI для перевода: {ai_status}")
     print(
-        f"📝 X: стиль {'faithful (без шаблонных вопросов)' if _X_FAITHFUL else 'legacy'}"
+        f"📝 X: voice={_X_VOICE} (X_FAITHFUL_X={'on' if _X_FAITHFUL else 'off'}, quote={'on' if _X_AUTO_QUOTE else 'off'}, logo={'on' if _X_AUTO_LOGO else 'off'})"
         f", предпросмотр ссылок: {'выкл (tombstone)' if _X_SUPPRESS_LINK_PREVIEWS else 'вкл'}"
     )
     print(
@@ -2070,6 +2598,12 @@ if __name__ == '__main__':
         print(
             f"🧵 Автотред: порог {AUTOPOST_THREAD_MIN_BYTES} байт и список; дедуп контента: {AUTOPOST_DEDUPE_HOURS}h"
         )
+        if AUTOPOST_NOTIFY_CHAT_ID:
+            print(f"📬 Уведомления об автопосте: chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
+        else:
+            print(
+                "📬 Уведомления об автопосте: выкл (нет AUTOPOST_NOTIFY_CHAT_ID или он равен id бота — см. лог при старте)"
+            )
     app.add_error_handler(_ptb_error_handler)
     # bootstrap_retries=-1: бесконечные попытки подключиться к Telegram при старте (сеть / DNS).
     try:
