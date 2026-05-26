@@ -248,6 +248,19 @@ try:
     AUTOPOST_THREAD_MIN_BYTES = max(500, int(_autopost_thread_min))
 except ValueError:
     AUTOPOST_THREAD_MIN_BYTES = 2000
+# Целевой размер части треда для историй/анекдотов (байт UTF-8 исходника до перевода)
+_autopost_thread_part = os.getenv("AUTOPOST_THREAD_PART_BYTES", "850").strip()
+try:
+    AUTOPOST_THREAD_PART_BYTES = max(400, int(_autopost_thread_part))
+except ValueError:
+    AUTOPOST_THREAD_PART_BYTES = 850
+_autopost_thread_part_max = os.getenv("AUTOPOST_THREAD_PART_MAX_BYTES", "1200").strip()
+try:
+    AUTOPOST_THREAD_PART_MAX_BYTES = max(
+        AUTOPOST_THREAD_PART_BYTES, int(_autopost_thread_part_max)
+    )
+except ValueError:
+    AUTOPOST_THREAD_PART_MAX_BYTES = 1200
 # Не публиковать тот же текст повторно в течение N часов
 _autopost_dedupe_h = os.getenv("AUTOPOST_DEDUPE_HOURS", "0").strip()
 try:
@@ -437,6 +450,42 @@ def clamp_to_x_text(text: str) -> str:
     while not fits_x_effective(t) and t:
         t = t[:-1]
     return _avoid_cutting_url(t).strip()
+
+
+_CASHTAG_RE = re.compile(r"(?<!\w)\$([A-Za-z][A-Za-z0-9]{1,14})\b")
+
+
+def count_x_cashtags(text: str) -> int:
+    return len(_CASHTAG_RE.findall(text or ""))
+
+
+def limit_x_cashtags(text: str, max_count: int = 1) -> str:
+    """
+    X API: не больше одного cashtag ($TICKER) на твит.
+    Лишние $ снимаем, буквы тикера оставляем (LINEA вместо $LINEA).
+    """
+    if not text or max_count < 1:
+        return text
+    total = 0
+    kept = 0
+
+    def repl(m: re.Match) -> str:
+        nonlocal total, kept
+        total += 1
+        if kept < max_count:
+            kept += 1
+            return m.group(0)
+        return m.group(1)
+
+    out = _CASHTAG_RE.sub(repl, text)
+    if total > max_count:
+        print(f"⚠️ X cashtag limit: оставлен {max_count} из {total}, остальные без $")
+    return out
+
+
+def prepare_x_post_text(text: str) -> str:
+    """Финальная подготовка текста перед отправкой в X API."""
+    return limit_x_cashtags(clamp_to_x_text(text))
 
 
 def fits_farcaster_text(text: str) -> bool:
@@ -816,6 +865,9 @@ def qa_check_x_text(text: str) -> List[str]:
     )
     if len(emojis) > 2:
         issues.append(f"too many emojis ({len(emojis)})")
+    cashtags = count_x_cashtags(text)
+    if cashtags > 1:
+        issues.append(f"too many cashtags ({cashtags})")
     return issues
 
 
@@ -948,8 +1000,8 @@ def post_to_x(
     quote_tweet_id: ID цитируемого твита (native quote — лучше внешней ссылки в ленте X).
     """
     url = "https://api.x.com/2/tweets"
-    # Для X применяем только лимит X (а не общий X+Farcaster), иначе текст режется слишком агрессивно.
-    clean = clamp_to_x_text(text)
+    # Для X: лимит длины + max 1 cashtag (иначе X API 403).
+    clean = prepare_x_post_text(text)
     payload: dict = {"text": clean}
     if media_ids:
         payload["media"] = {"media_ids": media_ids}
@@ -984,6 +1036,17 @@ def post_to_x(
             if resp2.status_code in (200, 201) and "data" in data:
                 return {"ok": True, "id": data["data"].get("id")}
             return {"ok": False, "status": resp2.status_code, "body": data}
+        # Запасной путь: если модель всё же вставила несколько $TICKER.
+        detail = str((data or {}).get("detail") or (data or {}).get("title") or "")
+        if resp.status_code == 403 and "cashtag" in detail.lower():
+            clean_retry = limit_x_cashtags(clean, max_count=1)
+            if clean_retry != clean:
+                payload["text"] = clean_retry
+                resp3 = requests.post(url, json=payload, headers=headers, timeout=20)
+                data3 = resp3.json()
+                if resp3.status_code in (200, 201) and "data" in data3:
+                    return {"ok": True, "id": data3["data"].get("id")}
+                return {"ok": False, "status": resp3.status_code, "body": data3}
         return {"ok": False, "status": resp.status_code, "body": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1379,7 +1442,221 @@ async def process_and_upload_photo(photo_file_id, bot) -> Tuple[Optional[List[st
     return media_ids, farcaster_embeds, skipped_photo_reason
 
 
-def split_long_post(text: str) -> List[str]:
+def _is_bullet_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    return bool(
+        s.startswith(("•", "-", "*", "·", "—", "–"))
+        or re.match(r"^\d+[\.\)]\s+", s)
+        or (s.startswith("**") and s.endswith("**") and len(s) < 50)
+    )
+
+
+def _is_list_style_post(text: str) -> bool:
+    """
+    Список/дайджест: много пунктов по всему тексту.
+    Не считаем списком хвост из 2–5 буллетов в конце анекдота/истории.
+    """
+    lines = [ln.strip() for ln in (text or "").split("\n") if ln.strip()]
+    if len(lines) < 3:
+        return False
+
+    bullet_indices = [i for i, ln in enumerate(lines) if _is_bullet_line(ln)]
+    if len(bullet_indices) < 2:
+        return False
+
+    tail_bullets = 0
+    for ln in reversed(lines):
+        if _is_bullet_line(ln):
+            tail_bullets += 1
+        else:
+            break
+
+    if tail_bullets >= 2 and tail_bullets == len(bullet_indices):
+        main_lines = lines[:-tail_bullets]
+        main_text = "\n".join(main_lines).strip()
+        main_bytes = len(main_text.encode("utf-8"))
+        total_bytes = max(1, len(text.encode("utf-8")))
+        if main_bytes >= int(total_bytes * 0.45):
+            return False
+
+    bullet_ratio = len(bullet_indices) / len(lines)
+    return bullet_ratio >= 0.28 or len(bullet_indices) >= 4
+
+
+def _detach_tail_bullets(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Отделяет короткий диалог в конце (несколько •/- строк), чтобы не резать историю по пунктам.
+    """
+    lines = (text or "").rstrip().split("\n")
+    if not lines:
+        return text, None
+
+    tail_lines: List[str] = []
+    i = len(lines) - 1
+    while i >= 0:
+        stripped = lines[i].strip()
+        if not stripped:
+            if tail_lines:
+                i -= 1
+                continue
+            break
+        if _is_bullet_line(lines[i]):
+            tail_lines.insert(0, lines[i])
+            i -= 1
+            continue
+        break
+
+    bullet_count = sum(1 for ln in tail_lines if _is_bullet_line(ln))
+    if bullet_count < 2:
+        return text.strip(), None
+
+    main = "\n".join(lines[: i + 1]).strip()
+    tail = "\n".join(tail_lines).strip()
+    if not main or not tail:
+        return text.strip(), None
+
+    total_len = len(text.encode("utf-8"))
+    tail_len = len(tail.encode("utf-8"))
+    if tail_len > total_len * 0.4:
+        return text.strip(), None
+
+    return main, tail
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Делит сплошной текст на предложения (RU/EN)."""
+    t = (text or "").strip()
+    if not t:
+        return []
+
+    parts = re.split(r"(?<=[.!?…])\s+(?=[«\"'(\[]?[A-ZА-ЯЁ0-9])", t)
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=[.!?…])\s+", t)
+
+    out: List[str] = []
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if len(p.encode("utf-8")) > AUTOPOST_THREAD_PART_MAX_BYTES:
+            words = p.split()
+            buf: List[str] = []
+            buf_len = 0
+            for word in words:
+                wlen = len(word.encode("utf-8")) + (1 if buf else 0)
+                if buf and buf_len + wlen > AUTOPOST_THREAD_PART_MAX_BYTES:
+                    out.append(" ".join(buf))
+                    buf = [word]
+                    buf_len = len(word.encode("utf-8"))
+                else:
+                    buf.append(word)
+                    buf_len += wlen
+            if buf:
+                out.append(" ".join(buf))
+        else:
+            out.append(p)
+    return out or [t]
+
+
+def _text_units_for_packing(text: str) -> List[str]:
+    """Абзацы; длинные абзацы — по предложениям."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    if not paras:
+        return []
+
+    units: List[str] = []
+    for para in paras:
+        if len(para.encode("utf-8")) <= AUTOPOST_THREAD_PART_MAX_BYTES:
+            units.append(para)
+        else:
+            units.extend(_split_sentences(para))
+    return units
+
+
+def _pack_text_chunks(
+    text: str,
+    target_bytes: int,
+    max_bytes: int,
+    min_bytes: int = 40,
+) -> List[str]:
+    """Собирает части треда по бюджету байт, не рвя предложения без нужды."""
+    t = (text or "").strip()
+    if not t:
+        return []
+    if len(t.encode("utf-8")) <= max_bytes:
+        return [t]
+
+    units = _text_units_for_packing(t)
+    if not units:
+        return [t]
+
+    chunks: List[str] = []
+    buf: List[str] = []
+    buf_len = 0
+
+    def flush() -> None:
+        nonlocal buf, buf_len
+        if not buf:
+            return
+        if len(buf) == 1:
+            chunk = buf[0]
+        elif any("\n" in u for u in buf):
+            chunk = "\n\n".join(buf)
+        else:
+            chunk = " ".join(buf)
+        chunks.append(chunk.strip())
+        buf = []
+        buf_len = 0
+
+    for unit in units:
+        ulen = len(unit.encode("utf-8"))
+        if ulen > max_bytes:
+            flush()
+            chunks.append(unit.strip())
+            continue
+        if buf and buf_len + ulen + 2 > target_bytes:
+            flush()
+        buf.append(unit)
+        buf_len += ulen + (2 if buf_len else 0)
+
+    flush()
+
+    cleaned = [c for c in chunks if c.strip()]
+    if not cleaned:
+        return [t]
+    if len(cleaned) == 1 and len(cleaned[0].encode("utf-8")) < min_bytes:
+        return [t]
+    return cleaned
+
+
+def split_narrative_post(text: str) -> List[str]:
+    """
+    Разбивает длинную историю/анекдот по абзацам и длине.
+    Короткий диалог с • в конце остаётся одним финальным твитом.
+    """
+    main, tail = _detach_tail_bullets(text)
+    body = main or (text or "").strip()
+    chunks = _pack_text_chunks(
+        body,
+        target_bytes=AUTOPOST_THREAD_PART_BYTES,
+        max_bytes=AUTOPOST_THREAD_PART_MAX_BYTES,
+    )
+
+    if tail:
+        merged = f"{chunks[-1]}\n\n{tail}" if chunks else tail
+        if chunks and len(merged.encode("utf-8")) <= AUTOPOST_THREAD_PART_MAX_BYTES:
+            chunks[-1] = merged
+        else:
+            chunks.append(tail)
+
+    if len(chunks) > 10 or len(chunks) <= 1:
+        return [text]
+    return chunks
+
+
+def split_list_post(text: str) -> List[str]:
     """
     Разбивает длинный пост на несколько постов по пунктам/секциям.
     Используется для постов с множеством отдельных тем (например, список проектов).
@@ -1420,6 +1697,32 @@ def split_long_post(text: str) -> List[str]:
     return sections
 
 
+def split_long_post(text: str) -> List[str]:
+    """Обратная совместимость: alias для split_list_post."""
+    return split_list_post(text)
+
+
+def choose_thread_sections(text: str) -> Tuple[List[str], str]:
+    """
+    Выбирает стратегию разбиения: list (дайджест) или narrative (история/анекдот).
+    Возвращает (sections, mode).
+    """
+    if _is_list_style_post(text):
+        sections = split_list_post(text)
+        mode = "list"
+    else:
+        sections = split_narrative_post(text)
+        mode = "narrative"
+
+    if len(sections) <= 1:
+        return [text], mode
+    print(
+        f"🧵 Thread split: mode={mode}, parts={len(sections)}, "
+        f"target={AUTOPOST_THREAD_PART_BYTES}B, max={AUTOPOST_THREAD_PART_MAX_BYTES}B"
+    )
+    return sections, mode
+
+
 async def auto_post_to_socials(
     text: str,
     photo_file_id: Optional[str] = None,
@@ -1436,18 +1739,14 @@ async def auto_post_to_socials(
         return {"ok": False, "error": "No text to post"}
     if not do_x and not do_fc:
         return {"ok": False, "error": "Both platforms disabled (do_x=0, do_fc=0)"}
-    
-    # Тред только для длинных дайджестов; порог задаётся AUTOPOST_THREAD_MIN_BYTES
+
+    # Длинный пост: тред по списку (•) или по абзацам/длине (история/анекдот)
     text_length = len(text.encode("utf-8"))
-    should_split = text_length > AUTOPOST_THREAD_MIN_BYTES and (
-        "•" in text or "\n-" in text or re.search(r"^\d+[\.\)]", text, re.MULTILINE)
-    )
-    
-    if should_split:
-        sections = split_long_post(text)
+    if text_length > AUTOPOST_THREAD_MIN_BYTES:
+        sections, _mode = choose_thread_sections(text)
         if len(sections) > 1:
             return await _post_as_thread(sections, photo_file_id, bot, do_x, do_fc)
-    
+
     return await _post_single_section(text, photo_file_id, bot, do_x, do_fc)
 
 
@@ -1652,6 +1951,7 @@ ENTITIES (USE THESE HANDLES whenever the project is mentioned, even if the sourc
 {entity_hints if entity_hints else "- (none)"}
 
 TICKER RULES:
+- X allows MAX ONE $TICKER per tweet (hard API limit). Other projects: @handle only, no $.
 - Use $TICKER from ENTITIES only when the project is the subject of that line (not generic mention).
 - Never invent a ticker that isn't in ENTITIES and isn't in the SOURCE.
 
@@ -1828,7 +2128,7 @@ def _finalize_dual_texts(source: str, x_raw: str, fc_raw: str) -> Tuple[str, str
     fc_t = ensure_urls_preserved(source, normalize_social_text(fc_raw))
     x_t = _avoid_cutting_url(x_t)
     fc_t = _avoid_cutting_url(fc_t)
-    x_t = clamp_to_x_text(x_t)
+    x_t = prepare_x_post_text(x_t)
     fc_t = clamp_to_farcaster_text(fc_t)
     return x_t, fc_t
 
@@ -1843,7 +2143,8 @@ def _translate_dual_grok_block(source: str) -> Optional[Tuple[str, str]]:
     hint_block = (
         "ENTITIES (USE THESE HANDLES whenever the project is mentioned, even if the source uses only the name):\n"
         + hints
-        + "\nTICKER RULES: use $TICKER from ENTITIES only when the project is the subject of that line.\n"
+        + "\nTICKER RULES: max ONE $TICKER per tweet (X API); other projects use @handle only. "
+        + "Use $ only when the project is the subject of that line.\n"
         if hints
         else ""
     )
@@ -1871,7 +2172,7 @@ def _translate_dual_grok_block(source: str) -> Optional[Tuple[str, str]]:
 {hint_block}
 For "x": {x_line}
 For "farcaster": {fc_line}
-Rules for both: stay in the author's voice; translate faithfully; all http(s) from SOURCE must appear in BOTH outputs; @ from ENTITIES whenever the project is mentioned; $ ticker from ENTITIES only when the project is the subject; no markdown; no new facts.
+Rules for both: stay in the author's voice; translate faithfully; all http(s) from SOURCE must appear in BOTH outputs; @ from ENTITIES whenever the project is mentioned; max ONE $ ticker in "x" (other projects @ only); no markdown; no new facts.
 
 SOURCE:
 {source}
@@ -1919,7 +2220,7 @@ def _translate_dual_gemini_block(source: str) -> Optional[Tuple[str, str]]:
         return None
     h = _build_project_entity_hints(source)
     hint_block = (
-        "\nENTITIES (USE THESE HANDLES whenever the project is mentioned; $TICKER only when project is subject):\n"
+        "\nENTITIES (USE THESE HANDLES whenever the project is mentioned; max ONE $TICKER in x, others @ only):\n"
         + h
         + "\n"
         if h
@@ -2596,7 +2897,9 @@ if __name__ == '__main__':
     print(f"🤖 Автопостинг из каналов: {autopost_status}")
     if AUTOPOST_ENABLED:
         print(
-            f"🧵 Автотред: порог {AUTOPOST_THREAD_MIN_BYTES} байт и список; дедуп контента: {AUTOPOST_DEDUPE_HOURS}h"
+            f"🧵 Автотред: от {AUTOPOST_THREAD_MIN_BYTES}B; list=пункты, narrative=абзацы; "
+            f"часть ~{AUTOPOST_THREAD_PART_BYTES}B (max {AUTOPOST_THREAD_PART_MAX_BYTES}B); "
+            f"дедуп: {AUTOPOST_DEDUPE_HOURS}h"
         )
         if AUTOPOST_NOTIFY_CHAT_ID:
             print(f"📬 Уведомления об автопосте: chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
