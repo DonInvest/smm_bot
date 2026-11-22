@@ -2,3 +2,5 @@ python-telegram-bot[ext,job-queue]
 python-dotenv
 google-genai
 requests-oauthlib
+requests
+anthropic>=2.12,<3

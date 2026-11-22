@@ -11,6 +11,8 @@
 [Unit]
 Description=SMM Telegram bot (X + Farcaster)
 After=network.target
+# Снимает лимит рестартов (Ubuntu 20.04 / systemd 245: только в [Unit], не в [Service])
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -19,7 +21,6 @@ WorkingDirectory=/root/smm_bot
 ExecStart=/root/smm_bot/venv/bin/python3 -u main.py
 Restart=always
 RestartSec=15
-StartLimitIntervalSec=0
 TimeoutStopSec=45
 KillMode=mixed
 Environment=PYTHONUNBUFFERED=1

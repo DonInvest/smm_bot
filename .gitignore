@@ -1,6 +1,18 @@
 .env
+.env.save
+.env.*.save
+!.env.example
 .x_tokens.json
+.autopost_state.json
+.coingecko_cache.json
 __pycache__/
 *.pyc
 .venv/
 venv/
+# случайные файлы из копипаста команд в каталог репо
+*--no-pager*
+.crosspost.sqlite3*
+.threads_token.json
+.crosspost_media/
+# личные заметки по ресерчу, не для публичного репо
+claude/

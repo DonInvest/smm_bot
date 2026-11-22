@@ -5,6 +5,7 @@ import os
 import requests
 from requests import exceptions as requests_exceptions
 import asyncio
+import random
 import re
 import tempfile
 import time
@@ -23,6 +24,9 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from requests_oauthlib import OAuth1
+from crosspost import CrosspostConfig, CrosspostService, RETRY_CALLBACK_PREFIX
+from crosspost.text import pop_crosspost_tags
+from writer.claude_writer import ClaudeWriter
 
 # .env рядом с main.py — так ключи видны и при запуске через systemd
 # override=True: значения из .env перезаписывают env, иначе на сервере могли остаться пустые
@@ -208,6 +212,30 @@ if (
     )
     AUTOPOST_NOTIFY_CHAT_ID = None
 
+# Claude как X-редактор (prompts/x_system.md). Без ANTHROPIC_API_KEY или при X_WRITER=grok работает старый путь.
+CLAUDE_WRITER: Optional[ClaudeWriter] = None
+try:
+    CLAUDE_WRITER = ClaudeWriter.from_env(os.path.dirname(os.path.abspath(__file__)))
+except Exception as _cw_err:
+    print(f"❌ Claude writer init failed: {_cw_err}")
+    CLAUDE_WRITER = None
+
+# Лимит своих постов в X за сутки (UTC). 0 = без лимита. Протокол восстановления после ярлыка: 1.
+try:
+    X_DAILY_MAX_POSTS = max(0, int(os.getenv("X_DAILY_MAX_POSTS", "0").strip() or "0"))
+except ValueError:
+    X_DAILY_MAX_POSTS = 0
+
+# Кросспост в Threads / Binance Square (фоновая очередь, см. crosspost/).
+CROSSPOST: Optional[CrosspostService] = None
+try:
+    _xp_cfg = CrosspostConfig.from_env(os.path.dirname(os.path.abspath(__file__)), AUTOPOST_NOTIFY_CHAT_ID)
+    if _xp_cfg.enabled:
+        CROSSPOST = CrosspostService(_xp_cfg)
+except Exception as _xp_err:
+    print(f"❌ Crosspost init failed: {_xp_err}")
+    CROSSPOST = None
+
 # Кастомные подсказки по проектам/тикерам для принудительной подсветки в X-постах.
 # Формат: "backpack:@Backpack:$BKP,solana:@solana:$SOL"
 PROJECT_ALIAS_HINTS = os.getenv("PROJECT_ALIAS_HINTS", "").strip()
@@ -293,7 +321,7 @@ _grok_circuit_log_at: float = 0.0
 _SEPARATE_XF = os.getenv("SEPARATE_X_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
 # Автопост из канала: куда публиковать (и сверху можно сузить #no_x / #no_fc / #only_tg)
 _AUTOP_X = os.getenv("AUTOPOST_X", "1").strip().lower() in ("1", "true", "yes", "on")
-_AUTOP_FC = os.getenv("AUTOPOST_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
+_AUTOP_FC = os.getenv("AUTOPOST_FARCASTER", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Лимиты
 X_MAX_CHARS = 280
@@ -1036,6 +1064,13 @@ def post_to_x(
             if resp2.status_code in (200, 201) and "data" in data:
                 return {"ok": True, "id": data["data"].get("id")}
             return {"ok": False, "status": resp2.status_code, "body": data}
+        # OAuth2 мёртв (refresh_token истёк): постим тем же v2-запросом через OAuth1, если ключи есть.
+        if resp.status_code == 401 and _x_oauth1() is not None:
+            print("⚠️ X OAuth2 401 и refresh не помог: публикую через OAuth1. Обнови OAuth2: python auth_x.py")
+            resp = requests.post(url, json=payload, auth=_x_oauth1(), timeout=20)
+            data = resp.json()
+            if resp.status_code in (200, 201) and "data" in data:
+                return {"ok": True, "id": data["data"].get("id")}
         # Запасной путь: если модель всё же вставила несколько $TICKER.
         detail = str((data or {}).get("detail") or (data or {}).get("title") or "")
         if resp.status_code == 403 and "cashtag" in detail.lower():
@@ -1119,6 +1154,13 @@ def post_to_farcaster(text: str, embeds: Optional[List[str]] = None, reply_to_ha
         return {"ok": False, "error": str(e)}
 
 
+def _x_oauth1() -> Optional[OAuth1]:
+    """OAuth1 user context для запасного пути, если все 4 ключа заданы."""
+    if X_API_KEY and X_API_SECRET and X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET:
+        return OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+    return None
+
+
 def delete_x_tweet(tweet_id: str) -> dict:
     if not tweet_id:
         return {"ok": False, "error": "Missing tweet_id"}
@@ -1136,6 +1178,11 @@ def delete_x_tweet(tweet_id: str) -> dict:
             if resp2.status_code in (200, 204):
                 return {"ok": True}
             return {"ok": False, "status": resp2.status_code, "body": data2}
+        if resp.status_code == 401 and _x_oauth1() is not None:
+            resp3 = requests.delete(url, auth=_x_oauth1(), timeout=20)
+            if resp3.status_code in (200, 204):
+                return {"ok": True}
+            return {"ok": False, "status": resp3.status_code, "body": resp3.json() if resp3.text else {}}
         return {"ok": False, "status": resp.status_code, "body": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1729,6 +1776,7 @@ async def auto_post_to_socials(
     bot=None,
     do_x: bool = True,
     do_fc: bool = True,
+    want_texts: bool = False,
 ) -> dict:
     """
     Автоматически переводит текст и публикует в X + Farcaster без кнопок.
@@ -1737,8 +1785,22 @@ async def auto_post_to_socials(
     """
     if not text:
         return {"ok": False, "error": "No text to post"}
-    if not do_x and not do_fc:
+    if not do_x and not do_fc and not want_texts:
         return {"ok": False, "error": "Both platforms disabled (do_x=0, do_fc=0)"}
+
+    # Claude пишет весь пост одним запросом (твит или тред). Сбой -> старый путь через Grok/Gemini.
+    if CLAUDE_WRITER:
+        written = await _write_x_with_claude(text)
+        if written:
+            parts, note = written
+            if len(parts) == 1:
+                res = await _post_single_section(text, photo_file_id, bot, do_x, do_fc, pre_x=parts[0])
+            else:
+                res = await _post_as_thread(parts, photo_file_id, bot, do_x, do_fc, pre_translated=True)
+            res["writer"] = "claude"
+            res["writer_note"] = note
+            return res
+        print("⚠️ Claude writer не дал текст, fallback на Grok/Gemini")
 
     # Длинный пост: тред по списку (•) или по абзацам/длине (история/анекдот)
     text_length = len(text.encode("utf-8"))
@@ -1748,6 +1810,37 @@ async def auto_post_to_socials(
             return await _post_as_thread(sections, photo_file_id, bot, do_x, do_fc)
 
     return await _post_single_section(text, photo_file_id, bot, do_x, do_fc)
+
+
+async def _write_x_with_claude(text: str) -> Optional[Tuple[List[str], str]]:
+    """Возвращает (готовые X-части, заметка редактора) или None."""
+    try:
+        hints = _build_project_entity_hints(text)
+        res = await asyncio.to_thread(CLAUDE_WRITER.write, text, hints, x_effective_length)
+    except Exception as e:
+        print(f"❌ Claude writer error: {type(e).__name__}: {e}")
+        return None
+    if not res or not res.parts:
+        return None
+    parts = [prepare_x_post_text(normalize_social_text(p)) for p in res.parts]
+    parts = [p for p in parts if p.strip()]
+    if not parts:
+        return None
+    print(
+        f"✅ Claude X ({res.model}): {len(parts)} част., usage={res.usage}"
+        + (f", остались замечания: {res.issues}" if res.issues else "")
+    )
+    return parts, res.note
+
+
+def _x_posts_today(state: dict) -> int:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    return int((state.get("_x_daily") or {}).get(day, 0))
+
+
+def _x_count_post(state: dict) -> None:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    state["_x_daily"] = {day: _x_posts_today(state) + 1}
 
 
 def _extract_social_ids(result: dict) -> Tuple[List[str], List[str]]:
@@ -1800,18 +1893,22 @@ async def _post_as_thread(
     bot=None,
     do_x: bool = True,
     do_fc: bool = True,
+    pre_translated: bool = False,
 ) -> dict:
     """
     Публикует несколько секций как тред (thread) в X и Farcaster.
     Первый пост - основной, остальные - ответы с задержкой 2-3 секунды.
+    pre_translated: секции уже готовые EN-твиты (Claude), перевод не вызывается.
     """
     load_dotenv(_load_env_path, override=True)
     pairs: List[Tuple[str, str]] = []
-    for section in sections:
+    for section in ([] if pre_translated else sections):
         tx, tfc = await translate_social_texts(section)
         if tx is None and tfc is None:
             return {"ok": False, "error": "Translation failed"}
         pairs.append(((tx or "").strip(), (tfc or "").strip()))
+    if pre_translated:
+        pairs = [(s.strip(), s.strip()) for s in sections if s and s.strip()]
     if not pairs:
         return {"ok": False, "error": "Translation failed"}
     
@@ -1843,7 +1940,7 @@ async def _post_as_thread(
     fc_replies: List[dict] = [result_fc]
     
     for sx, sfc in pairs[1:]:
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(random.uniform(2.5, 6.0))  # без идеально ровного ритма
         if do_x and x_thread_id and sx:
             x_reply = post_to_x(sx, reply_to_tweet_id=x_thread_id)
             x_replies.append(x_reply)
@@ -1874,6 +1971,7 @@ async def _post_as_thread(
         "ok": x_success > 0 or fc_success > 0,
         "thread": True,
         "posts_count": len(pairs),
+        "x_parts": [px for px, _ in pairs if px],
         "x": {"success": x_success, "total": len(x_replies), "replies": x_replies},
         "farcaster": {"success": fc_success, "total": len(fc_replies), "replies": fc_replies},
     }
@@ -2385,9 +2483,14 @@ async def _post_single_section(
     bot=None,
     do_x: bool = True,
     do_fc: bool = True,
+    pre_x: Optional[str] = None,
 ) -> dict:
-    """Одна публикация: раздельные тексты X / FC при SEPARATE_X_FARCASTER=1."""
-    tx, tfc = await translate_social_texts(text)
+    """Одна публикация: раздельные тексты X / FC при SEPARATE_X_FARCASTER=1.
+    pre_x: готовый X-текст (Claude), перевод не вызывается."""
+    if pre_x:
+        tx, tfc = pre_x, pre_x
+    else:
+        tx, tfc = await translate_social_texts(text)
     if (tx is None or not str(tx).strip()) and (tfc is None or not str(tfc).strip()):
         return {"ok": False, "error": "Translation failed"}
     try:
@@ -2440,9 +2543,30 @@ async def _post_single_section(
             "farcaster": result_fc,
             "text": x_text_to_post or tx,
             "text_farcaster": tfc,
+            "x_parts": [tx] if (tx and tx.strip()) else [],
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+async def crosspost_retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «повторить» из уведомления кросспоста."""
+    query = update.callback_query
+    if AUTOPOST_NOTIFY_CHAT_ID and query.message and query.message.chat_id != AUTOPOST_NOTIFY_CHAT_ID:
+        await query.answer("Нет доступа")
+        return
+    try:
+        delivery_id = int(query.data[len(RETRY_CALLBACK_PREFIX):])
+    except ValueError:
+        await query.answer("Некорректная кнопка")
+        return
+    ok = bool(CROSSPOST) and CROSSPOST.retry(delivery_id)
+    await query.answer("Поставил в очередь" if ok else "Уже не требуется")
+    if ok:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2550,6 +2674,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         print(f"⚠️ Нет текста в посте (одно фото/видео без подписи или пустой пост)")
         return
 
+    user_text, xp_excluded = pop_crosspost_tags(user_text)
     body, want_x, want_fc, only_tg = parse_channel_post_directives(user_text)
     if only_tg:
         print("ℹ️ #only_tg: автопост в X/FC пропущен (только Telegram)")
@@ -2559,8 +2684,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     do_m_x = want_x and _AUTOP_X
     do_m_fc = want_fc and _AUTOP_FC
-    if not do_m_x and not do_m_fc:
-        print("⏭️ Автопост: X и Farcaster выключены (env + директивы), пропуск")
+    xp_targets = (
+        sorted(CROSSPOST.cfg.platforms - xp_excluded) if (CROSSPOST and CROSSPOST.cfg.enabled) else []
+    )
+    if not do_m_x and not do_m_fc and not xp_targets:
+        print("⏭️ Автопост: все площадки выключены (env + директивы), пропуск")
         return
 
     print(f"✅ Обрабатываем пост из канала {chat_id}, текст: {body[:50]}...")
@@ -2581,6 +2709,22 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
     state_key = f"{chat_id}:{message_id}"
     prev_record = state.get(state_key)
+    # Правка старого поста: раньше любая правка (опечатка в посте недельной давности) уходила в X новым твитом.
+    # Теперь правка обрабатывается только в окне AUTOPOST_EDIT_WINDOW_SECONDS от времени исходного поста.
+    if is_edited:
+        _orig_ts = int(channel_post.date.timestamp()) if getattr(channel_post, "date", None) else 0
+        _ref_ts = int(prev_record.get("posted_at", 0)) if prev_record else _orig_ts
+        if not _ref_ts or int(time.time()) - _ref_ts > AUTOPOST_EDIT_WINDOW_SECONDS:
+            print(f"ℹ️ Правка позже окна {AUTOPOST_EDIT_WINDOW_SECONDS}s: никуда не публикуем повторно")
+            return
+    replacing_x = bool(is_edited and prev_record and prev_record.get("x_ids"))
+    x_cap_note = None
+    if do_m_x and X_DAILY_MAX_POSTS and not replacing_x and _x_posts_today(state) >= X_DAILY_MAX_POSTS:
+        do_m_x = False
+        x_cap_note = f"⏭️ X: пропуск, дневной лимит {X_DAILY_MAX_POSTS} (X_DAILY_MAX_POSTS)"
+        print(x_cap_note)
+        if not do_m_fc and not xp_targets:
+            return
     if is_edited and prev_record:
         age_sec = int(time.time() - int(prev_record.get("posted_at", 0)))
         if age_sec <= AUTOPOST_EDIT_WINDOW_SECONDS:
@@ -2594,11 +2738,42 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(f"ℹ️ Редактирование позже окна {AUTOPOST_EDIT_WINDOW_SECONDS}s — удаление пропущено")
     
     # Автоматически публикуем
-    result = await auto_post_to_socials(body, photo_file_id, context.bot, do_m_x, do_m_fc)
+    result = await auto_post_to_socials(
+        body, photo_file_id, context.bot, do_m_x, do_m_fc, want_texts=bool(xp_targets)
+    )
+
+    # Кросспост (Threads, Binance Square): в фоновую очередь, независимо от успеха X.
+    xp_notes: List[str] = []
+    if xp_targets:
+        xp_parts = result.get("x_parts") or []
+        if not xp_parts:
+            print("⚠️ Crosspost: нет EN-текста (перевод не удался), пропуск")
+        else:
+            try:
+                prev_xp = CROSSPOST.store.latest_post(state_key)
+                if is_edited and prev_xp:
+                    if int(time.time()) - prev_xp.created_at <= AUTOPOST_EDIT_WINDOW_SECONDS:
+                        xp_notes = CROSSPOST.handle_edit(state_key, xp_parts, photo_file_id, xp_targets)
+                    else:
+                        print("ℹ️ Crosspost: правка позже окна, повторно не публикуем")
+                else:
+                    CROSSPOST.enqueue(state_key, xp_parts, photo_file_id, xp_targets)
+            except Exception as e:
+                print(f"❌ Crosspost: ошибка постановки в очередь: {e}")
+                xp_notes.append(f"❌ Кросспост не поставлен в очередь: {e}")
+
+    # Дедуп и для поста, ушедшего только в кросспост (X выключен или лимит).
+    if not result.get("ok") and xp_targets and result.get("x_parts") and AUTOPOST_DEDUPE_HOURS > 0:
+        dmap = state.get("_dedupe") if isinstance(state.get("_dedupe"), dict) else {}
+        dmap[content_fingerprint] = int(time.time())
+        state["_dedupe"] = dmap
+        _save_autopost_state(state)
 
     # Сохраняем связь channel message -> social ids для последующего delete/repost
     if result.get("ok"):
         x_ids, fc_hashes = _extract_social_ids(result)
+        if x_ids and not replacing_x:
+            _x_count_post(state)
         # Сохраняем "hook" (первую строку X-текста) для будущей аналитики «что лучше залетает».
         _hook_src = (result.get("text") or "").strip()
         _hook = (_hook_src.split("\n", 1)[0] if _hook_src else "")[:200]
@@ -2715,6 +2890,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         if fc_link:
             notify_lines.append(f"✅ [Опубликовано в Farcaster]({fc_link})")
 
+    if not _AUTOP_FC:
+        notify_lines = [ln for ln in notify_lines if "Farcaster" not in ln]
+    if xp_targets and result.get("x_parts"):
+        _xp_names = ", ".join({"threads": "Threads", "square": "Binance Square"}.get(t, t) for t in xp_targets)
+        notify_lines.append(
+            f"🔁 {_xp_names}: в очереди, выйдет через {CROSSPOST.cfg.delay_seconds}s"
+            f"{' (DRY RUN)' if CROSSPOST.cfg.dry_run else ''}"
+        )
+    notify_lines.extend(xp_notes)
+    if not do_m_x:
+        # Тред с выключенным X раньше показывал «❌ X: не удалось», хотя X просто пропущен.
+        notify_lines = [ln for ln in notify_lines if not ln.startswith(("❌ X", "⏭️ X", "⚠️ X"))]
+        notify_lines.append(x_cap_note or "⏭️ X: пропуск (AUTOPOST_X=0 / #no_x)")
+    if result.get("writer") == "claude":
+        notify_lines.append("✍️ Текст X: Claude")
+        if result.get("writer_note"):
+            notify_lines.append(f"📝 Редактор: {result['writer_note']}")
     result_msg = "\n".join(notify_lines)
     
     # Логируем в консоль раздельно по платформам (для треда структура x/fc — success/total/replies, не ok/id)
@@ -2763,7 +2955,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     
     # Отправляем уведомление в Telegram только после успешного автопостинга
-    if AUTOPOST_NOTIFY_CHAT_ID and result.get("ok"):
+    if AUTOPOST_NOTIFY_CHAT_ID and (result.get("ok") or xp_targets):
         try:
             print(f"📨 Пытаюсь отправить уведомление в chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
             await context.bot.send_message(
@@ -2827,7 +3019,13 @@ async def debug_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _bot_post_init(application: Application) -> None:
-    """Опционально пишет timestamp в файл для внешнего watchdog (раз в 60s)."""
+    """Фоновые задачи: кросспост-воркер, продление токена Threads, heartbeat для watchdog."""
+    if CROSSPOST and CROSSPOST.cfg.enabled:
+        # Ссылки на задачи храним, иначе asyncio может собрать их сборщиком мусора.
+        application.bot_data["_bg_tasks"] = [
+            asyncio.create_task(CROSSPOST.run_worker(application.bot)),
+            asyncio.create_task(CROSSPOST.run_token_refresh(application.bot)),
+        ]
     path = os.getenv("BOT_HEALTH_FILE", "").strip()
     if not path:
         return
@@ -2856,6 +3054,7 @@ if __name__ == '__main__':
     # чтобы он НИКОГДА не перехватывал channel_post.
     non_channel_chats = filters.ChatType.PRIVATE | filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
     app.add_handler(MessageHandler(non_channel_chats & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(crosspost_retry_handler, pattern=f"^{RETRY_CALLBACK_PREFIX}"))
     app.add_handler(CallbackQueryHandler(button_handler))
     # DEBUG: логируем любые апдейты отдельной группой, не мешает основной логике
     app.add_handler(MessageHandler(filters.ALL, debug_any_update), group=1)
@@ -2875,6 +3074,10 @@ if __name__ == '__main__':
     else:
         ai_status = "не настроен"
     print(f"🚀 Бот @Don_Inv запущен")
+    print(
+        f"✍️ X-текст: {'Claude ' + CLAUDE_WRITER.model if CLAUDE_WRITER else 'Grok/Gemini (нет ANTHROPIC_API_KEY или X_WRITER=grok)'}"
+        f" | лимит X: {X_DAILY_MAX_POSTS or 'нет'} в сутки"
+    )
     print(f"🤖 AI для перевода: {ai_status}")
     print(
         f"📝 X: voice={_X_VOICE} (X_FAITHFUL_X={'on' if _X_FAITHFUL else 'off'}, quote={'on' if _X_AUTO_QUOTE else 'off'}, logo={'on' if _X_AUTO_LOGO else 'off'})"
@@ -2895,6 +3098,13 @@ if __name__ == '__main__':
     print(f"📷 X media (OAuth1): {oauth1_count}/4 ключей — фото в посты X {'включены' if oauth1_count == 4 else 'отключены (добавь X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET в .env)'}")
     print(f"🖼️ Farcaster images (Imgbb): {imgbb_status}")
     print(f"🤖 Автопостинг из каналов: {autopost_status}")
+    if CROSSPOST and CROSSPOST.cfg.enabled:
+        print(
+            f"🔁 Кросспост: {sorted(CROSSPOST.cfg.platforms)}, задержка {CROSSPOST.cfg.delay_seconds}s"
+            f"{', DRY RUN (CROSSPOST_DRY_RUN=1)' if CROSSPOST.cfg.dry_run else ''}"
+        )
+    else:
+        print("🔁 Кросспост: выключен (нет THREADS_ACCESS_TOKEN / BINANCE_SQUARE_API_KEY или CROSSPOST_ENABLED=0)")
     if AUTOPOST_ENABLED:
         print(
             f"🧵 Автотред: от {AUTOPOST_THREAD_MIN_BYTES}B; list=пункты, narrative=абзацы; "
