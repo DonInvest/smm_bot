@@ -133,11 +133,17 @@ class Store:
     def set_notified(self, post_id: int, value: bool = True) -> None:
         self._x("UPDATE posts SET notified=? WHERE id=?", (1 if value else 0, post_id))
 
-    def posts_to_notify(self) -> List[Post]:
+    def posts_to_notify(self, exclude_platforms: tuple = ()) -> List[Post]:
+        """Посты, у которых все доставки (кроме удалённых площадок) завершены."""
+        excl = ""
+        args: list = [PENDING, SENDING]
+        if exclude_platforms:
+            excl = f" AND d.platform NOT IN ({','.join('?' * len(exclude_platforms))})"
+            args += list(exclude_platforms)
         rows = self._q(
             "SELECT p.* FROM posts p WHERE p.notified=0 AND p.superseded=0 AND NOT EXISTS ("
-            " SELECT 1 FROM deliveries d WHERE d.post_id=p.id AND d.status IN (?,?))",
-            (PENDING, SENDING))
+            " SELECT 1 FROM deliveries d WHERE d.post_id=p.id AND d.status IN (?,?)" + excl + ")",
+            tuple(args))
         return [_post(r) for r in rows]
 
     # ---------- deliveries ----------
@@ -148,14 +154,23 @@ class Store:
         rows = self._q("SELECT * FROM deliveries WHERE id=?", (delivery_id,))
         return _delivery(rows[0]) if rows else None
 
-    def claim_due(self, now: int, limit: int = 5) -> List[Delivery]:
-        """Атомарно переводит созревшие pending в sending и возвращает их."""
+    def claim_due(self, now: int, limit: int = 5, platforms: Optional[tuple] = None,
+                  exclude: tuple = ()) -> List[Delivery]:
+        """Атомарно переводит созревшие pending в sending и возвращает их.
+        platforms: только эти площадки; exclude: кроме этих (удалённые агенты)."""
+        cond, args = "status=? AND next_at<=?", [PENDING, now]
+        if platforms:
+            cond += f" AND platform IN ({','.join('?' * len(platforms))})"
+            args += list(platforms)
+        if exclude:
+            cond += f" AND platform NOT IN ({','.join('?' * len(exclude))})"
+            args += list(exclude)
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 rows = self._conn.execute(
-                    "SELECT * FROM deliveries WHERE status=? AND next_at<=? ORDER BY next_at LIMIT ?",
-                    (PENDING, now, limit)).fetchall()
+                    f"SELECT * FROM deliveries WHERE {cond} ORDER BY next_at LIMIT ?",
+                    tuple(args + [limit])).fetchall()
                 for r in rows:
                     self._conn.execute(
                         "UPDATE deliveries SET status=?, attempts=attempts+1, updated_at=? WHERE id=?",
@@ -188,9 +203,17 @@ class Store:
         args.append(delivery_id)
         self._x(f"UPDATE deliveries SET {', '.join(sets)} WHERE id=?", tuple(args))
 
-    def recover_interrupted(self) -> int:
-        """После рестарта: sending -> uncertain (мог уйти частично, автоповтор опасен)."""
-        rows = self._q("SELECT id FROM deliveries WHERE status=?", (SENDING,))
+    def recover_interrupted(self, exclude: tuple = (), older_than: int = 0) -> int:
+        """sending -> uncertain (мог уйти частично, автоповтор опасен).
+        exclude: площадки удалённых агентов не трогаем; older_than: только зависшие дольше N секунд."""
+        cond, args = "status=?", [SENDING]
+        if exclude:
+            cond += f" AND platform NOT IN ({','.join('?' * len(exclude))})"
+            args += list(exclude)
+        if older_than:
+            cond += " AND updated_at<?"
+            args.append(int(time.time()) - older_than)
+        rows = self._q(f"SELECT id FROM deliveries WHERE {cond}", tuple(args))
         for r in rows:
             self.update_delivery(r["id"], status=UNCERTAIN,
                                  error="бот перезапущен во время отправки, проверь площадку и нажми «повторить»")

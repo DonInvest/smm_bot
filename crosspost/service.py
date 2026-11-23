@@ -15,10 +15,10 @@ from . import store as st
 from .config import CrosspostConfig
 from .errors import PlatformError
 from .square_api import SquareClient
-from .text import build_square_payload, build_threads_parts
+from .text import build_long_text, build_square_payload, build_threads_parts
 from .threads_api import ThreadsClient
 
-PLATFORM_TITLES = {"threads": "Threads", "square": "Binance Square"}
+PLATFORM_TITLES = {"threads": "Threads", "square": "Binance Square", "debank": "DeBank"}
 RETRY_CALLBACK_PREFIX = "xp_retry:"
 
 
@@ -159,6 +159,16 @@ class CrosspostService:
                                         sleep=self._sleep)
         return {"ids": [pid] if pid else [], "url": link or ("" if pid else "опубликовано, ссылку API не вернул")}
 
+    def remote_job(self, delivery: st.Delivery) -> Dict:
+        """Задание для внешнего агента: текст под площадку."""
+        post = self.store.get_post(delivery.post_id)
+        if delivery.platform == "debank":
+            text = build_long_text(post.x_parts)
+        else:
+            raise PlatformError(f"no remote builder for {delivery.platform}")
+        return {"delivery_id": delivery.id, "post_id": post.id, "platform": delivery.platform,
+                "text": text, "photo_file_id": post.photo_file_id, "created_at": post.created_at}
+
     def _send(self, post: st.Post, d: st.Delivery, photo: Optional[str]) -> Dict:
         if d.platform == "threads":
             return self._send_threads(post, d, photo)
@@ -167,7 +177,7 @@ class CrosspostService:
         raise PlatformError(f"unknown platform {d.platform}")
 
     async def process_due(self, bot=None) -> int:
-        due = self.store.claim_due(int(time.time()))
+        due = self.store.claim_due(int(time.time()), exclude=self.cfg.remote_platforms)
         for d in due:
             post = self.store.get_post(d.post_id)
             if post is None:
@@ -205,6 +215,8 @@ class CrosspostService:
             title = PLATFORM_TITLES.get(d.platform, d.platform)
             if d.status == st.DONE:
                 lines.append(f"✅ {title}: {d.url or 'опубликовано'}")
+            elif d.status in (st.PENDING, st.SENDING) and d.platform in self.cfg.remote_platforms:
+                lines.append(f"⏳ {title}: публикует агент на Mac, результат придёт отдельно")
             elif d.status == st.CANCELLED:
                 lines.append(f"⏭️ {title}: отменён ({d.error or 'правка'})")
             elif d.status == st.UNCERTAIN:
@@ -217,13 +229,13 @@ class CrosspostService:
 
     async def notify_finished(self, bot) -> None:
         if bot is None or not self.cfg.notify_chat_id:
-            for p in self.store.posts_to_notify():
+            for p in self.store.posts_to_notify(self.cfg.remote_platforms):
                 self.store.set_notified(p.id)
                 self._cleanup_media(p.id)
             return
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-        for p in self.store.posts_to_notify():
+        for p in self.store.posts_to_notify(self.cfg.remote_platforms):
             text, retry_ids = self.build_report(p)
             markup = None
             if retry_ids:
@@ -260,7 +272,7 @@ class CrosspostService:
 
     # ================= фоновые задачи =================
     async def run_worker(self, bot) -> None:
-        n = self.store.recover_interrupted()
+        n = self.store.recover_interrupted(exclude=self.cfg.remote_platforms)
         if n:
             self._log(f"⚠️ Crosspost: {n} отправок прервались при рестарте, помечены как «неизвестно»")
         self._log(f"🔁 Crosspost воркер запущен: {sorted(self.cfg.platforms)}, задержка {self.cfg.delay_seconds}s"

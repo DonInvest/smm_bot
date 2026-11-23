@@ -33,6 +33,9 @@ class CrosspostConfig:
     db_path: str
     token_file: str
     platforms: set = field(default_factory=set)
+    # Площадки, которые забирает внешний агент, а не серверный воркер.
+    remote_platforms: tuple = ("debank",)
+    remote_max_age_hours: int = 12
 
     @classmethod
     def from_env(cls, base_dir: str, notify_chat_id: Optional[int]) -> "CrosspostConfig":
@@ -43,6 +46,8 @@ class CrosspostConfig:
             platforms.add("threads")
         if square_key and _flag("CROSSPOST_SQUARE", "1"):
             platforms.add("square")
+        if _flag("CROSSPOST_DEBANK", "0"):
+            platforms.add("debank")  # публикует агент на Mac (debank_agent/), сервер только ставит в очередь
         return cls(
             enabled=_flag("CROSSPOST_ENABLED", "1") and bool(platforms),
             dry_run=_flag("CROSSPOST_DRY_RUN", "1"),
@@ -58,4 +63,5 @@ class CrosspostConfig:
             db_path=os.path.join(base_dir, ".crosspost.sqlite3"),
             token_file=os.path.join(base_dir, ".threads_token.json"),
             platforms=platforms,
+            remote_max_age_hours=max(1, _int("DEBANK_MAX_AGE_HOURS", 12)),
         )

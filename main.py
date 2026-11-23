@@ -2911,7 +2911,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not _AUTOP_FC:
         notify_lines = [ln for ln in notify_lines if "Farcaster" not in ln]
     if xp_targets and result.get("x_parts"):
-        _xp_names = ", ".join({"threads": "Threads", "square": "Binance Square"}.get(t, t) for t in xp_targets)
+        _xp_names = ", ".join({"threads": "Threads", "square": "Binance Square", "debank": "DeBank"}.get(t, t) for t in xp_targets)
         notify_lines.append(
             f"🔁 {_xp_names}: в очереди, выйдет через {CROSSPOST.cfg.delay_seconds}s"
             f"{' (DRY RUN)' if CROSSPOST.cfg.dry_run else ''}"

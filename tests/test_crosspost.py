@@ -207,6 +207,33 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(s.store.get_post(pid).notified)
 
 
+class RemotePlatformTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_worker_skips_debank_and_report_does_not_wait(self):
+        s = CrosspostService(make_cfg(self.tmp, platforms={"threads", "debank"}), threads=FakeThreads(),
+                             square=FakeSquare(), sleep=lambda x: None, log=lambda m: None)
+        pid = s.enqueue("c:1", ["Hi"], None, ["threads", "debank"])
+        asyncio.run(s.process_due(bot=None))
+        ds = {d.platform: d.status for d in s.store.deliveries(pid)}
+        self.assertEqual(ds, {"threads": st.DONE, "debank": st.PENDING})
+        self.assertEqual([p.id for p in s.store.posts_to_notify(s.cfg.remote_platforms)], [pid])
+        text, retry = s.build_report(s.store.get_post(pid))
+        self.assertIn("агент на Mac", text)
+        self.assertEqual(retry, [])
+
+    def test_remote_claim_and_job_text(self):
+        s = CrosspostService(make_cfg(self.tmp, platforms={"debank"}), threads=FakeThreads(),
+                             square=FakeSquare(), sleep=lambda x: None, log=lambda m: None)
+        s.enqueue("c:1", ["1/2 Hello @Foo", "2/2 Bye"], "fid", ["debank"])
+        due = s.store.claim_due(int(time.time()), limit=1, platforms=("debank",))
+        job = s.remote_job(due[0])
+        self.assertEqual(job["text"], "Hello Foo\n\nBye")
+        self.assertEqual(job["photo_file_id"], "fid")
+        self.assertEqual(s.store.recover_interrupted(exclude=("debank",)), 0)
+
+
 class SquareClientTests(unittest.TestCase):
     def _resp(self, status, json_body):
         r = mock.Mock()

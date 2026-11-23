@@ -16,3 +16,4 @@ venv/
 .crosspost_media/
 # личные заметки по ресерчу, не для публичного репо
 claude/
+debank_agent/.venv/
