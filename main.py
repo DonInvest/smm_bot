@@ -358,7 +358,11 @@ def normalize_social_text(text: str) -> str:
     - нормализуем пробелы, сохраняем переносы строк
     """
     t = text.strip()
-    t = re.sub(r"[*_`]+", "", t)
+    # Markdown-символы убираем только вне ссылок: "_" в URL (x.com/don_inv/...) ломал ссылку.
+    t = "".join(
+        chunk if chunk.startswith(("http://", "https://")) else re.sub(r"[*_`]+", "", chunk)
+        for chunk in re.split(r"(https?://\S+)", t)
+    )
     t = t.replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
@@ -475,6 +479,8 @@ def fits_x_effective(text: str) -> bool:
 def clamp_to_x_text(text: str) -> str:
     """Только лимит X (t.co), без ужатия по байтам Farcaster."""
     t = normalize_social_text(text)
+    if fits_x_effective(t):
+        return t.strip()  # раньше _avoid_cutting_url срезал ссылку в конце даже у короткого текста
     while not fits_x_effective(t) and t:
         t = t[:-1]
     return _avoid_cutting_url(t).strip()
@@ -2525,6 +2531,15 @@ async def _post_single_section(
                 media_ids=media_ids,
                 quote_tweet_id=quote_id,
             )
+            # X API разрешает цитировать только свои посты или те, где ты упомянут. Иначе 403:
+            # публикуем обычным твитом со ссылкой на исходный пост.
+            if quote_id and not result_x.get("ok") and result_x.get("status") == 403:
+                fallback_text = tx or ""
+                if quote_id not in fallback_text:
+                    fallback_text = f"{fallback_text.rstrip()}\n\nhttps://x.com/i/status/{quote_id}"
+                print("⚠️ Quote-tweet запрещён X API (403), публикую обычным твитом со ссылкой")
+                x_text_to_post = fallback_text
+                result_x = post_to_x(x_text_to_post, media_ids=media_ids)
         else:
             result_x = {"ok": True, "skipped": True, "id": None}
 
