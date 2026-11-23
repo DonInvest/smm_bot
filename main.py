@@ -321,6 +321,8 @@ _grok_circuit_log_at: float = 0.0
 _SEPARATE_XF = os.getenv("SEPARATE_X_FARCASTER", "1").strip().lower() in ("1", "true", "yes", "on")
 # Автопост из канала: куда публиковать (и сверху можно сузить #no_x / #no_fc / #only_tg)
 _AUTOP_X = os.getenv("AUTOPOST_X", "1").strip().lower() in ("1", "true", "yes", "on")
+# Когда автопост в X выключен: присылать готовый EN-черновик в Telegram для ручной публикации.
+X_DRAFT_TO_TG = os.getenv("X_DRAFT_TO_TG", "0").strip().lower() in ("1", "true", "yes", "on")
 _AUTOP_FC = os.getenv("AUTOPOST_FARCASTER", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Лимиты
@@ -2702,7 +2704,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     xp_targets = (
         sorted(CROSSPOST.cfg.platforms - xp_excluded) if (CROSSPOST and CROSSPOST.cfg.enabled) else []
     )
-    if not do_m_x and not do_m_fc and not xp_targets:
+    want_x_draft = bool(want_x and X_DRAFT_TO_TG and not do_m_x)
+    if not do_m_x and not do_m_fc and not xp_targets and not want_x_draft:
         print("⏭️ Автопост: все площадки выключены (env + директивы), пропуск")
         return
 
@@ -2754,7 +2757,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Автоматически публикуем
     result = await auto_post_to_socials(
-        body, photo_file_id, context.bot, do_m_x, do_m_fc, want_texts=bool(xp_targets)
+        body, photo_file_id, context.bot, do_m_x, do_m_fc, want_texts=bool(xp_targets) or want_x_draft
     )
 
     # Кросспост (Threads, Binance Square): в фоновую очередь, независимо от успеха X.
@@ -2917,7 +2920,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not do_m_x:
         # Тред с выключенным X раньше показывал «❌ X: не удалось», хотя X просто пропущен.
         notify_lines = [ln for ln in notify_lines if not ln.startswith(("❌ X", "⏭️ X", "⚠️ X"))]
-        notify_lines.append(x_cap_note or "⏭️ X: пропуск (AUTOPOST_X=0 / #no_x)")
+        if want_x_draft and result.get("x_parts"):
+            _n = len(result["x_parts"])
+            notify_lines.append(
+                "📝 X: автопост на паузе, черновик следующим сообщением"
+                if _n == 1 else f"📝 X: автопост на паузе, тред из {_n} частей следующими сообщениями по порядку"
+            )
+        else:
+            notify_lines.append(x_cap_note or "⏭️ X: пропуск (AUTOPOST_X=0 / #no_x)")
     if result.get("writer") == "claude":
         notify_lines.append("✍️ Текст X: Claude")
         if result.get("writer_note"):
@@ -2970,7 +2980,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     
     # Отправляем уведомление в Telegram только после успешного автопостинга
-    if AUTOPOST_NOTIFY_CHAT_ID and (result.get("ok") or xp_targets):
+    if AUTOPOST_NOTIFY_CHAT_ID and (result.get("ok") or xp_targets or want_x_draft):
         try:
             print(f"📨 Пытаюсь отправить уведомление в chat_id={AUTOPOST_NOTIFY_CHAT_ID}")
             await context.bot.send_message(
@@ -2994,6 +3004,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print("✅ Уведомление отправлено в plain text fallback")
             except Exception as e2:
                 print(f"❌ Не удалось отправить уведомление даже в plain text: {e2}")
+
+    # Черновик для ручной публикации в X: отдельным сообщением, без разметки, чтобы копировался как есть.
+    if AUTOPOST_NOTIFY_CHAT_ID and want_x_draft and result.get("x_parts"):
+        parts = result["x_parts"]
+        for part in parts:  # только сам текст: сообщение копируется целиком и вставляется в X
+            try:
+                await context.bot.send_message(
+                    chat_id=AUTOPOST_NOTIFY_CHAT_ID,
+                    text=part,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                print(f"⚠️ Не удалось отправить X-черновик: {e}")
 
 
 async def _ptb_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
