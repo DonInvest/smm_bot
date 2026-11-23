@@ -69,7 +69,9 @@ class ThreadsClient:
         expires_at = int(data.get("expires_at") or 0) if same_source else 0
         if not expires_at:
             expires_at = self._token_expires_at()
-        if expires_at and expires_at - time.time() > renew_before_sec:
+        if not expires_at:
+            return None  # срок узнать не удалось (сеть, временный блок Meta): проверим в следующий раз
+        if expires_at - time.time() > renew_before_sec:
             return None  # рано: Meta не продлевает токен моложе 24 ч, а продлевать заранее незачем
         try:
             r = self._http.get(
